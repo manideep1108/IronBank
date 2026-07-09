@@ -1,0 +1,450 @@
+<title>IronBank — Dashboard Build Guide</title>
+<style>
+  :root {
+    --ground: #F6F7F9; --surface: #FFFFFF; --surface-2: #F0F2F5;
+    --ink: #1B2027; --ink-soft: #566072; --ink-faint: #8A93A3;
+    --line: #E2E6EC; --line-strong: #CDD3DC;
+    --accent: #9A6B2F; --accent-ink: #7A531F; --accent-bg: #F3EADB;
+    --attn: #9A6B10; --attn-bg: #F7EED6;
+    --good: #2F7A5B; --good-bg: #E0F0E8;
+    --crit: #A63A2E; --crit-bg: #F6E2DE;
+    --info: #3E5C8A; --info-bg: #E4EBF5;
+    --shadow: 0 1px 2px rgba(20,30,50,.06), 0 6px 20px rgba(20,30,50,.05);
+    --serif: Georgia, "Iowan Old Style", "Times New Roman", serif;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "Consolas", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #12151A; --surface: #191D24; --surface-2: #1F242C;
+      --ink: #E6EAF0; --ink-soft: #A2ACBB; --ink-faint: #6E7887;
+      --line: #2A2F38; --line-strong: #3A404B;
+      --accent: #CBA55C; --accent-ink: #DDBE7E; --accent-bg: #2A2418;
+      --attn: #D8B25A; --attn-bg: #2C2513;
+      --good: #6FC79E; --good-bg: #16271F;
+      --crit: #E08574; --crit-bg: #2C1A16;
+      --info: #8FB0DE; --info-bg: #161F2C;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="light"] {
+    --ground: #F6F7F9; --surface: #FFFFFF; --surface-2: #F0F2F5;
+    --ink: #1B2027; --ink-soft: #566072; --ink-faint: #8A93A3;
+    --line: #E2E6EC; --line-strong: #CDD3DC;
+    --accent: #9A6B2F; --accent-ink: #7A531F; --accent-bg: #F3EADB;
+    --attn: #9A6B10; --attn-bg: #F7EED6; --good: #2F7A5B; --good-bg: #E0F0E8;
+    --crit: #A63A2E; --crit-bg: #F6E2DE; --info: #3E5C8A; --info-bg: #E4EBF5;
+    --shadow: 0 1px 2px rgba(20,30,50,.06), 0 6px 20px rgba(20,30,50,.05);
+  }
+  :root[data-theme="dark"] {
+    --ground: #12151A; --surface: #191D24; --surface-2: #1F242C;
+    --ink: #E6EAF0; --ink-soft: #A2ACBB; --ink-faint: #6E7887;
+    --line: #2A2F38; --line-strong: #3A404B;
+    --accent: #CBA55C; --accent-ink: #DDBE7E; --accent-bg: #2A2418;
+    --attn: #D8B25A; --attn-bg: #2C2513; --good: #6FC79E; --good-bg: #16271F;
+    --crit: #E08574; --crit-bg: #2C1A16; --info: #8FB0DE; --info-bg: #161F2C;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.28);
+  }
+
+  * { box-sizing: border-box; }
+  body { background: var(--ground); color: var(--ink); font-family: var(--sans);
+    line-height: 1.6; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 920px; margin: 0 auto; padding: clamp(1.2rem, 3vw, 3rem) clamp(1rem, 3vw, 2rem) 4rem; }
+
+  h1, h2, h3 { font-family: var(--serif); font-weight: 600; text-wrap: balance; letter-spacing: -0.01em; }
+  p, li { max-width: 68ch; }
+  code { font-family: var(--mono); font-size: 0.86em; background: var(--surface-2);
+    border: 1px solid var(--line); border-radius: 4px; padding: 0.08em 0.4em; color: var(--ink);
+    white-space: nowrap; }
+  code.block { display: block; white-space: pre-wrap; padding: 0.7em 0.9em; margin: 0.5rem 0 0; }
+
+  /* Masthead */
+  .mast { border-bottom: 2px solid var(--ink); padding-bottom: 1.4rem; margin-bottom: 2.2rem; }
+  .mast .eyebrow { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.18em;
+    text-transform: uppercase; color: var(--accent-ink); margin: 0 0 0.6rem; }
+  .mast h1 { font-size: clamp(2rem, 5vw, 3rem); margin: 0 0 0.5rem; line-height: 1.05; }
+  .mast .lede { font-size: 1.08rem; color: var(--ink-soft); margin: 0; max-width: 60ch; }
+  .mast .meta { margin-top: 1rem; font-family: var(--mono); font-size: 0.74rem; color: var(--ink-faint);
+    display: flex; gap: 1.2rem; flex-wrap: wrap; }
+
+  .flow > * + * { margin-top: 1rem; }
+  section { margin-top: 3rem; scroll-margin-top: 1rem; }
+  h2 { font-size: 1.7rem; margin: 0 0 0.3rem; display: flex; align-items: baseline; gap: 0.6rem; }
+  h2 .n { font-family: var(--mono); font-size: 0.9rem; color: var(--accent); font-weight: 400; }
+  .section-lede { color: var(--ink-soft); margin: 0 0 1.4rem; }
+
+  /* Callout */
+  .note { background: var(--accent-bg); border: 1px solid var(--line-strong); border-radius: 8px;
+    padding: 1rem 1.1rem; display: flex; gap: 0.75rem; align-items: flex-start; }
+  .note.warn { background: var(--attn-bg); }
+  .note.info { background: var(--info-bg); }
+  .note .ic { font-size: 1.1rem; line-height: 1.5; flex-shrink: 0; }
+  .note p { margin: 0; font-size: 0.95rem; }
+  .note strong { color: var(--ink); }
+  .note + .note { margin-top: 0.8rem; }
+
+  /* Chips */
+  .chip { display: inline-flex; align-items: center; gap: 0.3em; font-family: var(--mono);
+    font-size: 0.7rem; letter-spacing: 0.03em; text-transform: uppercase; padding: 0.16em 0.55em;
+    border-radius: 999px; border: 1px solid var(--line-strong); background: var(--surface-2);
+    color: var(--ink-soft); white-space: nowrap; }
+  .chip.table { color: var(--info); border-color: color-mix(in srgb, var(--info) 40%, var(--line)); background: var(--info-bg); }
+  .chip.board { color: var(--accent-ink); border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); background: var(--accent-bg); }
+  .chip.settled { color: var(--good); background: var(--good-bg); border-color: color-mix(in srgb, var(--good) 35%, var(--line)); }
+  .chip.mapping { color: var(--attn); background: var(--attn-bg); border-color: color-mix(in srgb, var(--attn) 35%, var(--line)); }
+  .chip.notion { color: var(--info); background: var(--info-bg); border-color: color-mix(in srgb, var(--info) 35%, var(--line)); }
+
+  /* DB reference grid */
+  .db-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.9rem; }
+  .db { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.1rem; box-shadow: var(--shadow); }
+  .db h3 { font-size: 1.12rem; margin: 0 0 0.15rem; }
+  .db .role { font-size: 0.85rem; color: var(--ink-soft); margin: 0 0 0.7rem; }
+  .db ul { margin: 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 0.3rem; }
+  .db ul li { font-family: var(--mono); font-size: 0.72rem; color: var(--ink-soft);
+    background: var(--surface-2); border: 1px solid var(--line); border-radius: 4px; padding: 0.1em 0.45em; max-width: none; }
+
+  /* Recipe cards */
+  .recipes { display: flex; flex-direction: column; gap: 0.9rem; }
+  .recipe { background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+    padding: 1.05rem 1.15rem; box-shadow: var(--shadow); }
+  .recipe > header { display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;
+    flex-wrap: wrap; margin-bottom: 0.7rem; }
+  .recipe h4 { font-family: var(--sans); font-size: 1.02rem; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+  .spec { display: grid; grid-template-columns: max-content 1fr; gap: 0.35rem 1rem; margin: 0; font-size: 0.92rem; }
+  .spec dt { font-family: var(--mono); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--ink-faint); padding-top: 0.15rem; }
+  .spec dd { margin: 0; color: var(--ink); }
+  .recipe .why { margin: 0.75rem 0 0; padding-top: 0.7rem; border-top: 1px dashed var(--line-strong);
+    font-size: 0.88rem; color: var(--ink-soft); }
+  .recipe .why b { color: var(--accent-ink); font-weight: 600; }
+
+  /* Steps */
+  ol.steps { counter-reset: s; list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.7rem; }
+  ol.steps > li { counter-increment: s; position: relative; padding-left: 2.4rem; min-height: 1.7rem; }
+  ol.steps > li::before { content: counter(s); position: absolute; left: 0; top: -0.05rem;
+    width: 1.7rem; height: 1.7rem; border-radius: 50%; background: var(--ink); color: var(--ground);
+    font-family: var(--mono); font-size: 0.82rem; display: grid; place-items: center; font-weight: 600; }
+
+  .workflow { background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+    padding: 1.15rem 1.25rem; box-shadow: var(--shadow); }
+  .workflow + .workflow { margin-top: 0.9rem; }
+  .workflow h4 { font-size: 1.08rem; margin: 0 0 0.2rem; font-family: var(--serif); }
+  .workflow .trigger { font-size: 0.86rem; color: var(--ink-soft); margin: 0 0 0.9rem; }
+
+  /* Status reference table */
+  .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); }
+  table.ref { border-collapse: collapse; width: 100%; font-size: 0.92rem; background: var(--surface); }
+  table.ref th, table.ref td { text-align: left; padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  table.ref thead th { font-family: var(--mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--ink-faint); background: var(--surface-2); }
+  table.ref tr:last-child td { border-bottom: none; }
+
+  .foot { margin-top: 3.5rem; padding-top: 1.4rem; border-top: 1px solid var(--line); color: var(--ink-faint);
+    font-size: 0.84rem; }
+  .foot code { font-size: 0.8em; }
+  a { color: var(--accent-ink); }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+  @media (max-width: 480px) {
+    .spec { grid-template-columns: 1fr; gap: 0.1rem 0; }
+    .spec dt { padding-top: 0.5rem; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="mast">
+    <p class="eyebrow">🏦 IronBank · Notion Setup</p>
+    <h1>Dashboard Build Guide</h1>
+    <p class="lede">Your expenses flow in automatically from Telegram and Splitwise. This guide walks you through building the Notion views — once — so the home page reads like a proper ledger and tells you exactly what needs your attention.</p>
+    <div class="meta">
+      <span>Databases: Expenses · People · Groups · Splitwise Users</span>
+      <span>Sync: every ~15 min · /sync runs it now</span>
+      <span><a href="https://github.com/manideep1108/IronBank">github.com/manideep1108/IronBank</a></span>
+    </div>
+  </header>
+
+  <div class="note warn">
+    <span class="ic">📊</span>
+    <p><strong>No chart views in this build.</strong> Every "breakdown" below is a <strong>grouped table</strong> or <strong>board</strong> with a <strong>column Sum</strong> turned on — Notion totals each group for you, so you get spend-by-category and monthly totals without a single chart. Wherever you'd expect a pie or bar, group a table instead.</p>
+  </div>
+  <div class="note info">
+    <span class="ic">⏱️</span>
+    <p><strong>Data is up to ~15 minutes old</strong> — that's the sync interval. <code>Groups → Last Synced</code> shows the last run; send <code>/sync</code> to the bot to refresh right now, or <code>/status</code> to see sync health and what's waiting on you.</p>
+  </div>
+
+  <section class="flow">
+    <h2><span class="n">01</span> How it fits together</h2>
+    <p class="section-lede">You almost never touch Notion to <em>enter</em> data — you build the views and then read them.</p>
+    <p>You message the Telegram bot ("<em>800 dinner, me and Aditya</em>"). Apps Script parses it, resolves each name to a person, works out the split, records it in the <strong>Expenses</strong> database, and — when it can — pushes it to Splitwise. A background sync runs every ~15 minutes: it pulls your Splitwise activity (group <em>and</em> direct friend expenses) back into Notion, refreshes everyone's balances, and carries out anything you've flagged (settle a parked expense, merge a name, delete a row).</p>
+    <p>Notion's API can create databases and properties but <strong>not</strong> views — so the databases below already exist and stay in sync, and the view layer is the one thing you build by hand. Do it once; it keeps working.</p>
+  </section>
+
+  <section>
+    <h2><span class="n">02</span> Notion mechanics, in 60 seconds</h2>
+    <p class="section-lede">Everything below is a <em>linked view</em> plus a filter. If you've built one before, skip ahead.</p>
+    <ol class="steps">
+      <li>On your dashboard page type <code>/linked</code> and choose <strong>Linked view of database</strong>, then pick the source database (e.g. <em>Expenses</em>).</li>
+      <li>Open the view's <strong>⋯ menu → Filter / Sort / Group</strong> and apply the recipe's spec.</li>
+      <li>For sums: hover just <strong>below a number column's last row</strong> — a <code>Calculate ▾</code> toggle appears; choose <strong>Sum</strong>. In grouped views, every group gets its own sum.</li>
+      <li><strong>⋯ → Properties</strong> controls which columns show; drag to reorder.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2><span class="n">03</span> The four databases</h2>
+    <p class="section-lede">What each one holds and the fields the views lean on.</p>
+    <div class="db-grid">
+      <div class="db">
+        <h3>Expenses</h3>
+        <p class="role">Every transaction — one row each. The ledger.</p>
+        <ul>
+          <li>Amount (your share)</li><li>Total Amount</li><li>Date</li><li>Month</li><li>Year</li>
+          <li>Expense Type</li><li>Payer</li><li>Participants</li><li>Splits Summary</li>
+          <li>Settlement Status</li><li>Source</li><li>Splitwise ID</li><li>Sync Action</li><li>Sync Status</li>
+        </ul>
+      </div>
+      <div class="db">
+        <h3>People</h3>
+        <p class="role">Everyone you actually split with. Identity + balances live here.</p>
+        <ul>
+          <li>Name</li><li>Splitwise Identity</li><li>Candidates (suggested matches)</li><li>Splitwise Name</li>
+          <li>Default Group</li><li>Net Balance</li><li>Net Balance By Group</li><li>Aliases</li>
+          <li>Merge Into</li><li>Email</li><li>Splitwise User ID</li>
+        </ul>
+      </div>
+      <div class="db">
+        <h3>Groups</h3>
+        <p class="role">Your Splitwise groups. Tick one to start importing it.</p>
+        <ul><li>Name</li><li>Allowed</li><li>Backfilled</li><li>Last Synced</li><li>Splitwise Group ID</li></ul>
+      </div>
+      <div class="db">
+        <h3>Splitwise Users</h3>
+        <p class="role">Your Splitwise address book — the pick-list for a person's identity. Read-only reference.</p>
+        <ul><li>Name</li><li>Splitwise User ID</li><li>Email</li><li>In Groups</li></ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">04</span> ⚠️ Needs Your Attention</h2>
+    <p class="section-lede">Put this block at the very top of the home page — it's your to-do list. Three linked views.</p>
+    <div class="recipes">
+      <article class="recipe">
+        <header><h4>Expenses to map</h4><span class="chip table">Table</span></header>
+        <dl class="spec">
+          <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
+          <div style="display:contents"><dt>Filter</dt><dd><code>Settlement Status</code> is <span class="chip mapping">Needs mapping</span></dd></div>
+          <div style="display:contents"><dt>Sort</dt><dd><code>Date</code> — descending</dd></div>
+          <div style="display:contents"><dt>Show</dt><dd>Description · Splits Summary · Total Amount · Participants</dd></div>
+        </dl>
+        <p class="why"><b>Why:</b> these expenses are recorded but couldn't be pushed to Splitwise — usually a participant isn't set up yet. Fixing the person (section 07) clears them automatically on the next sync.</p>
+      </article>
+      <article class="recipe">
+        <header><h4>People to set up</h4><span class="chip table">Table</span></header>
+        <dl class="spec">
+          <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>People</dd></div>
+          <div style="display:contents"><dt>Filter</dt><dd><code>Splitwise User ID</code> is empty</dd></div>
+          <div style="display:contents"><dt>Show</dt><dd>Name · Aliases · <strong>Candidates</strong> · Splitwise Identity</dd></div>
+        </dl>
+        <p class="why"><b>Why:</b> a person can't settle until they have a Splitwise identity. The <code>Candidates</code> column carries auto-suggested matches from your contacts — usually the right person is already listed, so it's a glance-and-pick in the <code>Splitwise Identity</code> dropdown, not an 80-contact hunt.</p>
+      </article>
+      <article class="recipe">
+        <header><h4>Pending sync actions</h4><span class="chip table">Table</span></header>
+        <dl class="spec">
+          <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
+          <div style="display:contents"><dt>Filter</dt><dd><code>Sync Action</code> is not empty <em>and</em> is not <code>None</code></dd></div>
+          <div style="display:contents"><dt>Show</dt><dd>Description · Sync Action · Sync Status</dd></div>
+        </dl>
+        <p class="why"><b>Why:</b> confirms a Delete or Re-push you requested is queued; the row clears once the next sync carries it out. If something couldn't be done (say, Splitwise rejected a delete), <code>Sync Status</code> says so and the action retries next sync.</p>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">05</span> 💰 Balances at a Glance</h2>
+    <p class="section-lede">Who owes whom — the numbers come straight from Splitwise, refreshed every sync.</p>
+    <div class="recipes">
+      <article class="recipe">
+        <header><h4>Balances</h4><span class="chip table">Table</span></header>
+        <dl class="spec">
+          <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>People</dd></div>
+          <div style="display:contents"><dt>Filter</dt><dd><code>Net Balance</code> is not <code>0</code> (hide settled people)</dd></div>
+          <div style="display:contents"><dt>Sort</dt><dd><code>Net Balance</code> — descending</dd></div>
+          <div style="display:contents"><dt>Show</dt><dd>Name · Net Balance · Net Balance By Group</dd></div>
+          <div style="display:contents"><dt>Calc</dt><dd>On <code>Net Balance</code>, set the column calculation to <strong>Sum</strong></dd></div>
+        </dl>
+        <p class="why"><b>Why:</b> positive means they owe you, negative means you owe them. The column Sum at the bottom is your overall net position. <code>Net Balance By Group</code> breaks it down by group <em>name</em> for when you actually settle — settle in the Splitwise app; the payment flows back here on the next sync.</p>
+      </article>
+      <article class="recipe">
+        <header><h4>Owes you / You owe <span style="color:var(--ink-faint);font-weight:400">(optional)</span></h4><span class="chip board">Board</span></header>
+        <dl class="spec">
+          <div style="display:contents"><dt>Prep</dt><dd>Add a formula property <code>Direction</code> to People:<code class="block">if(prop("Net Balance") &gt; 0, "Owes you", if(prop("Net Balance") &lt; 0, "You owe", "Settled"))</code></dd></div>
+          <div style="display:contents"><dt>Group by</dt><dd><code>Direction</code></dd></div>
+          <div style="display:contents"><dt>Calc</dt><dd>Sum of <code>Net Balance</code> per column</dd></div>
+        </dl>
+        <p class="why"><b>Why:</b> two tidy stacks so you can see both sides at once.</p>
+      </article>
+    </div>
+    <div class="note" style="margin-top:0.9rem">
+      <span class="ic">🤝</span>
+      <p><strong>Where are the settle-up payments?</strong> Recorded payments deliberately don't appear as Expense rows — they only move <code>Net Balance</code>. If someone paid you back, look here, not in the ledger.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">06</span> 📊 Expenditure</h2>
+    <p class="section-lede">Your spend, broken down — all as grouped tables with a <strong>Sum on Amount</strong>. <code>Amount</code> is <em>your</em> share (what you actually spent); <code>Total Amount</code> is the full bill. Totals below use <code>Amount</code>.</p>
+    <div class="recipes">
+      <article class="recipe">
+        <header><h4>This Month</h4><span class="chip table">Table</span></header>
+        <dl class="spec">
+          <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
+          <div style="display:contents"><dt>Filter</dt><dd><code>Date</code> is within — This month</dd></div>
+          <div style="display:contents"><dt>Sort</dt><dd><code>Date</code> — descending</dd></div>
+          <div style="display:contents"><dt>Calc</dt><dd>Sum on <code>Amount</code></dd></div>
+        </dl>
+        <p class="why"><b>Why:</b> your running spend this month, newest first, totalled at the foot. (Same numbers as <code>/report</code> in Telegram.)</p>
+      </article>
+      <article class="recipe">
+        <header><h4>By Category</h4><span class="chip board">Board</span> <span class="chip table">or Table</span></header>
+        <dl class="spec">
+          <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
+          <div style="display:contents"><dt>Group by</dt><dd><code>Expense Type</code></dd></div>
+          <div style="display:contents"><dt>Calc</dt><dd>Sum on <code>Amount</code> per group</dd></div>
+        </dl>
+        <p class="why"><b>Why:</b> this is the pie chart, without the pie — each category carries its own total. As a Board it's visual; as a grouped Table it's compact.</p>
+      </article>
+      <article class="recipe">
+        <header><h4>By Month</h4><span class="chip table">Table</span></header>
+        <dl class="spec">
+          <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
+          <div style="display:contents"><dt>Group by</dt><dd><code>Month</code> (a formula field, format <code>YYYY-MM</code>, so years don't merge)</dd></div>
+          <div style="display:contents"><dt>Sort</dt><dd>group by <code>Month</code> descending</dd></div>
+          <div style="display:contents"><dt>Calc</dt><dd>Sum on <code>Amount</code> per month</dd></div>
+        </dl>
+        <p class="why"><b>Why:</b> month-over-month spend as a stack of totals. <code>Month</code> and <code>Year</code> are computed from <code>Date</code> automatically — nothing to fill in.</p>
+      </article>
+      <article class="recipe">
+        <header><h4>By Person</h4><span class="chip table">Table</span></header>
+        <dl class="spec">
+          <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
+          <div style="display:contents"><dt>Filter</dt><dd><code>Participants</code> contains — <em>the person</em></dd></div>
+          <div style="display:contents"><dt>Sort</dt><dd><code>Date</code> — descending</dd></div>
+          <div style="display:contents"><dt>Calc</dt><dd>Sum on <code>Amount</code> (and <code>Total Amount</code> if you like)</dd></div>
+        </dl>
+        <p class="why"><b>Why:</b> your entire shared history with one person — this is exactly what the <code>Participants</code> relation exists for. Duplicate the view per person you split with often.</p>
+      </article>
+      <article class="recipe">
+        <header><h4>All Expenses</h4><span class="chip table">Table</span></header>
+        <dl class="spec">
+          <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
+          <div style="display:contents"><dt>Filter</dt><dd>none</dd></div>
+          <div style="display:contents"><dt>Sort</dt><dd><code>Date</code> — descending</dd></div>
+        </dl>
+        <p class="why"><b>Why:</b> the raw ledger — for searching, audits, and bulk edits. Keep it low on the page or inside a toggle.</p>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">07</span> 🔧 Splitwise Manager</h2>
+    <p class="section-lede">The controls: which groups to import, and your contact list.</p>
+    <div class="recipes">
+      <article class="recipe">
+        <header><h4>Groups</h4><span class="chip table">Table</span></header>
+        <dl class="spec">
+          <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Groups</dd></div>
+          <div style="display:contents"><dt>Show</dt><dd>Name · <code>Allowed</code> · <code>Backfilled</code> · Last Synced</dd></div>
+          <div style="display:contents"><dt>Sort</dt><dd><code>Allowed</code> first, then Name</dd></div>
+        </dl>
+        <p class="why"><b>Why:</b> tick <code>Allowed</code> to onboard a group — the next sync pulls its full history once (<code>Backfilled</code> flips to done), then keeps it current. Untick to stop importing. Non-INR groups never appear — that's by design.</p>
+      </article>
+      <article class="recipe">
+        <header><h4>Contacts</h4><span class="chip table">Table</span></header>
+        <dl class="spec">
+          <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Splitwise Users</dd></div>
+          <div style="display:contents"><dt>Show</dt><dd>Name · Email · In Groups</dd></div>
+          <div style="display:contents"><dt>Sort</dt><dd>Name — ascending</dd></div>
+        </dl>
+        <p class="why"><b>Why:</b> your whole Splitwise address book, kept in sync automatically. You don't edit it — it's what the <code>Splitwise Identity</code> dropdown picks from.</p>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">08</span> 🧩 How to resolve things</h2>
+    <p class="section-lede">The handful of actions you'll actually take — all done by editing a row, no IDs to type.</p>
+
+    <div class="workflow">
+      <h4>Set up a person (clear a "Needs mapping" expense)</h4>
+      <p class="trigger">When: a new name appears, or an expense is parked as <span class="chip mapping">Needs mapping</span>.</p>
+      <ol class="steps">
+        <li>Open the person's row in <strong>People</strong>.</li>
+        <li>Glance at <code>Candidates</code> — the sync suggests likely contacts there — then pick them from the <code>Splitwise Identity</code> dropdown. Their Splitwise ID and readable name fill in on the next sync.</li>
+        <li><em>Optional:</em> set a <code>Default Group</code> to route their expenses into a specific Splitwise group. <strong>Leave it empty</strong> and they settle as direct friend expenses instead.</li>
+        <li>Done. The next sync pushes any parked expenses with them and clears the flag — <code>/sync</code> in Telegram if you don't want to wait.</li>
+      </ol>
+    </div>
+
+    <div class="workflow">
+      <h4>Merge a nickname or duplicate</h4>
+      <p class="trigger">When: the bot created a stray person (e.g. "Mang") that's really someone you already have (Mangalik).</p>
+      <ol class="steps">
+        <li>Open the <strong>stray</strong> person's row.</li>
+        <li>Set <code>Merge Into</code> to the real person.</li>
+        <li>The next sync folds them together: it saves the stray name as an alias, re-points every expense to the real person, and archives the stray. Future messages using that nickname resolve on their own.</li>
+      </ol>
+    </div>
+
+    <div class="workflow">
+      <h4>Answer an ambiguous name</h4>
+      <p class="trigger">When: a name could be two people (e.g. "Adi" → Aditya or Aditi).</p>
+      <ol class="steps">
+        <li>The bot asks right in Telegram with buttons — tap the right person.</li>
+        <li>That saves the nickname to them, so it's never asked again. Nothing to do in Notion.</li>
+        <li>If the buttons expired: the expense <strong>is already logged</strong> — fix it with <code>Merge Into</code> here in Notion. Don't re-send the message; that would log it twice.</li>
+      </ol>
+    </div>
+
+    <div class="workflow">
+      <h4>Delete or re-push an expense</h4>
+      <p class="trigger">When: the bot got something wrong, or you want to remove an expense everywhere.</p>
+      <ol class="steps">
+        <li>Fastest: tap <strong>🗑️ Delete</strong> on the bot's reply in Telegram — it removes the expense from Splitwise and archives it in Notion, and tells you honestly if either step failed.</li>
+        <li>From Notion: set <code>Sync Action</code> to <code>Delete</code> (removes it everywhere) or <code>Re-push</code> (rebuilds the Splitwise side — the replacement is created <em>before</em> the old one is deleted, so a failed re-push destroys nothing). The next sync carries it out and writes the outcome to <code>Sync Status</code>.</li>
+      </ol>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">09</span> Settlement status reference</h2>
+    <p class="section-lede">The <code>Settlement Status</code> on each expense tells you where it stands.</p>
+    <div class="table-scroll">
+      <table class="ref">
+        <thead><tr><th>Status</th><th>Meaning</th><th>Do you need to act?</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><span class="chip settled">Settled-via-Splitwise</span></td>
+            <td>Pushed to Splitwise (a group or a direct friend expense). Balances reflect it.</td>
+            <td>No.</td>
+          </tr>
+          <tr>
+            <td><span class="chip mapping">Needs mapping</span></td>
+            <td>Recorded, but a participant isn't set up yet, so it couldn't be pushed.</td>
+            <td>Yes — set up the person (section 08). It clears automatically.</td>
+          </tr>
+          <tr>
+            <td><span class="chip notion">Notion-only</span></td>
+            <td>Kept in your ledger but never sent to Splitwise — a solo expense, or historical data.</td>
+            <td>No.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <p>Views are a Notion UI feature the API can't create — building them by hand is a one-time setup. Once done, everything stays current on its own: new expenses land from Telegram, balances refresh from Splitwise, and your edits (identity picks, merges, deletes) are carried out on the next sync (~15 min — or <code>/sync</code> now, <code>/status</code> for health). Setup and source: <a href="https://github.com/manideep1108/IronBank">github.com/manideep1108/IronBank</a>.</p>
+  </footer>
+
+</div>

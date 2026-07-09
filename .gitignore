@@ -1,9 +1,6 @@
 # onboarding state (contains Notion database ids — no secrets, but it's per-instance)
 .ironbank_onboarding_state.json
 
-# local copy of the hosted dashboard build guide (the repo version is DASHBOARD.md)
-dashboard_build_guide.html
-
 # never commit credentials of any shape
 config*.json
 *.env
