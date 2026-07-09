@@ -1,10 +1,13 @@
 # IronBank — Notion Dashboard Build Guide
 
+<!-- Keep in sync with dashboard_build_guide.html — the interactive version of this guide
+     (progress tracking, copy buttons). This file is the plain-text equivalent. -->
+
 Your expenses flow into Notion automatically from Telegram and Splitwise. This guide walks you through building the **views** — once — so your home page reads like a proper ledger and tells you exactly what needs your attention.
 
 > **Why manual?** The Notion API can create databases and properties but **not views** — the view layer is the one thing you build by hand. Do it once; it keeps working forever.
 >
-> **No charts in this build.** Every "breakdown" below is a **grouped table** or **board** with a **column Sum** turned on — Notion totals each group for you. Wherever you'd expect a pie or bar chart, group a table instead.
+> **No charts in this build.** Every "breakdown" below is a **grouped table** or **board** with a **column Sum** turned on — Notion totals each group for you. Wherever you'd expect a pie or bar chart, group a table instead. (On paid Notion plans you can additionally drop in a native **chart view** on the same data — the recipes below work on every plan, free included.)
 >
 > **Freshness:** data is up to ~15 minutes old (the sync interval). `Groups → Last Synced` shows the last sync; send `/sync` to the bot to refresh now, `/status` to see sync health.
 
@@ -51,9 +54,9 @@ Create one page (e.g. **🏦 IronBank**) and add sections in this order — atte
 **Balances** — `Table` on **People**
 - Filter: `Net Balance` **≠** 0  *(hides settled people)*
 - Sort: `Net Balance` descending
-- Show: Name · Net Balance · Net Balance By Group
+- Show: Name · Net Balance · Net Balance By Group · Net Balance Updated
 - Calculate: **Sum** on `Net Balance`
-- *Why:* positive = they owe you, negative = you owe them; the column Sum is your overall net position. `Net Balance By Group` shows per-group amounts (by group **name**) for when you actually settle — settle in the Splitwise app; payments flow back automatically.
+- *Why:* positive = they owe you, negative = you owe them; the column Sum is your overall net position. `Net Balance By Group` shows per-group amounts (by group **name**) for when you actually settle — settle in the Splitwise app; payments flow back automatically. `Net Balance Updated` is the freshness stamp: an old date means that number stopped syncing (e.g. no longer a Splitwise friend) — don't trust it blindly.
 
 **Owes you / You owe** *(optional)* — `Board` on **People**
 - First add a formula property `Direction` to People:

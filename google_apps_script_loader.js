@@ -163,12 +163,19 @@ function pollSplitwise() {
   return runRemote("pollSplitwise", []);
 }
 
-// Run ONCE from the editor to install the 15-minute sync trigger.
+// Installs the sync trigger (onboarding.sh normally does this for you through the Web App's
+// installTrigger action — run this manually only as a fallback). Cadence comes from the
+// POLL_INTERVAL_MIN Script Property (1/5/10/15/30; default 15).
 // Idempotent: clears any existing pollSplitwise triggers first so re-running won't stack them.
 function installPollTrigger() {
   removePollTriggers();
-  ScriptApp.newTrigger("pollSplitwise").timeBased().everyMinutes(15).create();
-  Logger.log("Installed pollSplitwise trigger (every 15 minutes).");
+  var mins = 15;
+  try {
+    var v = parseInt(PropertiesService.getScriptProperties().getProperty("POLL_INTERVAL_MIN") || "15", 10);
+    if ([1, 5, 10, 15, 30].indexOf(v) >= 0) mins = v;
+  } catch (e) {}
+  ScriptApp.newTrigger("pollSplitwise").timeBased().everyMinutes(mins).create();
+  Logger.log("Installed pollSplitwise trigger (every " + mins + " minutes).");
 }
 
 function removePollTriggers() {

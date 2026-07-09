@@ -48,16 +48,33 @@ The script walks you through everything and automates what can be automated:
 
 | Step | Automated? | What happens |
 |---|---|---|
-| Collect + validate credentials | ✅ | Telegram bot token, Gemini API key, Splitwise Personal Access Token, Notion integration token + parent page — each verified live |
-| Provision the 4 Notion databases | ✅ | Exact schema incl. formulas, relations, and the select options that drive the parser. Idempotent — re-runs only add what's missing |
-| Apps Script project + loader paste | 🖐 guided | [script.new](https://script.new), paste `google_apps_script_loader.js` once |
+| Collect + validate credentials | ✅ | Telegram bot token, Gemini API key, Splitwise Personal Access Token, Notion integration token + parent page — each verified live. Your Telegram chat id is pinned up front (required — prevents bot hijack) |
+| Provision the 4 Notion databases | ✅ | Exact schema incl. formulas, relations, and the select options that drive the parser. Idempotent — re-runs reuse saved database ids (survives renames) and only add what's missing |
+| Apps Script project + loader paste | 🖐 guided | [script.new](https://script.new), paste `google_apps_script_loader.js` once (the script puts it on your clipboard) |
 | Secrets → Script Properties | 🖐 guided | Google has no API for Script Properties (which is why secrets belong there) |
 | Deploy the Web App | 🖐 guided | Execute as **Me**, access **Anyone** |
 | Non-secret config + Telegram webhook | ✅ | Pushed through the deployed Web App; webhook registered with a per-instance secret |
-| Install the 15-min sync trigger | 🖐 one click | Run `installPollTrigger` in the editor |
-| Build the Notion views | 🖐 once | The Notion API cannot create views — follow [DASHBOARD.md](DASHBOARD.md) |
+| Verify the pasted secrets | ✅ | `diagnose` live-tests every secret inside Apps Script and reports pass/fail per key — a typo'd token is caught immediately, not at the first silent sync failure |
+| Install the 15-min sync trigger | ✅ | Installed through the Web App (it executes as you); fallback: run `installPollTrigger` in the editor |
+| Run the first sync | ✅ | Your Splitwise groups + contacts are already in Notion before the script exits |
+| Build the Notion views | 🖐 once | The Notion API cannot create views — open [dashboard_build_guide.html](dashboard_build_guide.html) (or [DASHBOARD.md](DASHBOARD.md)) |
 
 **Credentials you'll need:** a Telegram bot ([@BotFather](https://t.me/BotFather)), a Gemini API key ([AI Studio](https://aistudio.google.com/apikey)), a Splitwise Personal Access Token ([register an app](https://secure.splitwise.com/apps)), and a Notion internal integration ([my-integrations](https://www.notion.so/my-integrations)) shared to one parent page.
+
+### Running on Windows
+
+`onboarding.sh` is a bash script, and it runs on Windows as-is inside **Git Bash** — there is no separate `.ps1`/`.bat` version to keep in sync. One-time setup:
+
+1. Install [Git for Windows](https://gitforwindows.org) (bundles **Git Bash** and `curl`).
+2. Install [Python 3](https://www.python.org/downloads/windows/) and tick **"Add python.exe to PATH"** in the installer.
+3. Open **Git Bash** (Start menu), then run the same three commands as above:
+   ```bash
+   git clone https://github.com/manideep1108/IronBank.git
+   cd IronBank
+   ./onboarding.sh
+   ```
+
+Notes: paste into Git Bash with right-click or `Shift+Insert`; the script copies the Apps Script loader to your clipboard automatically (via `clip.exe`); line endings are pinned to LF by `.gitattributes`, so the default `autocrlf` clone setting can't break the script. Prefer **WSL**? That works identically — `sudo apt install curl python3` if they're missing, then the same three commands.
 
 ## Daily use
 
@@ -89,9 +106,11 @@ Everything lives in Apps Script **Script Properties** (⚙ Project Settings). `o
 | `NOTION_TOKEN` | 🔒 | Notion integration token |
 | `GITHUB_TOKEN` | 🔒 | Only for private forks (loader fetch) |
 | `OWNER_NAME` | — | Who "me/I/my" resolves to |
-| `TELEGRAM_CHAT_ID` | — | The owner's chat. Pre-pin it (onboarding offers this) — otherwise the first chat to message the bot claims ownership |
+| `TELEGRAM_CHAT_ID` | — | The owner's chat. Onboarding pins it up front — otherwise the first chat to message the bot claims ownership |
 | `NOTION_DB_EXPENSES` / `_PEOPLE` / `_GROUPS` / `_SW_USERS` | — | Database ids (written by onboarding) |
+| `NOTION_PARENT_PAGE_ID` | — | The page holding the 4 databases (written by onboarding) |
 | `WEBAPP_URL` | — | The deployment URL; setting it (re)registers the Telegram webhook |
+| `POLL_INTERVAL_MIN` | — | Sync cadence in minutes: 1/5/10/15/30 (default 15). Set it, then re-run the trigger install (`installTrigger` action or `installPollTrigger`) |
 | `SCHEMA_VERSION` | — | Notion schema generation stamp |
 
 Keys prefixed `POLL_`, `TG_WEBHOOK_SECRET`, `SW_CONTACTS_SIG`, `ROSTER_LAST_GOOD`, and `ironbank_lkg_*` are internal state — leave them alone.
@@ -104,14 +123,14 @@ You paste the **loader** once. On every request it fetches `google_apps_script.j
 2. Syntax-check before pushing: `python -c "import esprima; esprima.parseScript(open('google_apps_script.js',encoding='utf-8').read())"`.
 3. Push. Instances pick it up within ~10 minutes (GitHub raw CDN + loader cache). `doGet` on the Web App URL returns `{ok, version}` for a quick smoke test.
 
-Fork? Point `GITHUB_RAW_URL` in your pasted loader at your fork.
+Fork? Point `GITHUB_RAW_URL` in your pasted loader at your fork. **Running a fork that other people use?** Point it at a release **tag**, not `main` — otherwise every push to your `main` executes immediately inside their Google accounts.
 
 ## Security notes
 
 - Secrets live only in Script Properties — never in code, Notion, or this repository.
 - The Telegram webhook is registered with a random per-instance query secret; Telegram-shaped POSTs without it are dropped (Apps Script can't read headers, so this replaces Telegram's native `secret_token`).
-- Only the pinned `TELEGRAM_CHAT_ID` can talk to the bot.
-- The Web App exposes no data over HTTP: `GET` returns a version stamp; the only authenticated `POST` actions are `ping` and `updateConfig`.
+- Only the pinned `TELEGRAM_CHAT_ID` can talk to the bot; messages from any other chat are dropped silently (no reply that would confirm the bot exists).
+- The Web App exposes no stored data over HTTP: `GET` returns a version stamp; the authenticated `POST` actions are `ping`, `updateConfig`, `diagnose` (secret checks return pass/fail only, never values), `installTrigger`, and `sync`.
 
 ## Troubleshooting
 

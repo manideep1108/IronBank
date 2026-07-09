@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.0.0";
+var IRONBANK_VERSION = "1.1.0";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.sh)
 
 // ==========================================
@@ -117,6 +117,23 @@ function calculateSplits(data) {
   return splitsArray;
 }
 
+// Refuse impossible split plans: fixed amounts at/over the total while people are still
+// supposed to "split the rest" — calculateSplits would silently drop those people from the
+// expense (remainder ≤ 0 skips the weighted loop). Returns an error message, or null when fine.
+function checkFixedVsTotal_(parsed) {
+  var fixed = parsed.fixed_splits || [], weighted = parsed.weighted_splits || [];
+  if (!weighted.length || !fixed.length) return null;
+  var sum = 0;
+  for (var i = 0; i < fixed.length; i++) sum += parseFloat(fixed[i].amount) || 0;
+  var total = parseFloat(parsed.total_amount) || 0;
+  if (sum >= total) {
+    return "❌ **Not logged — the fixed amounts (₹" + sum.toFixed(2) + ") already reach the total (₹" +
+           total.toFixed(2) + ")**, but " + weighted.length + " participant(s) were supposed to split the rest. " +
+           "Nothing was saved — please re-send with corrected amounts.";
+  }
+  return null;
+}
+
 // ==========================================
 // WEB APP ENTRY — doGet (health check only)
 // ==========================================
@@ -201,10 +218,9 @@ function doPost(e) {
         }
 
         if (chatId !== allowedChatId) {
+          // Silently drop: replying would confirm to whoever found the bot that it's live,
+          // and would let strangers burn quota by provoking responses.
           logToSheet("⚠️ [doPost] Unauthorized Chat ID attempted access: " + chatId);
-          if (chatId) {
-            sendTelegramMessage(token, chatId, "Access denied. Unauthorized user.");
-          }
           return HtmlService.createHtmlOutput("OK");
         }
 
@@ -315,6 +331,10 @@ function doPost(e) {
             processExpenseText(text, geminiKey, token, chatId, messageId, ownerNameSetting);
             return HtmlService.createHtmlOutput("OK");
           }
+
+          // Anything else (voice note, sticker, location, …) would otherwise get pure silence.
+          sendTelegramMessage(token, chatId, "🤔 I can only read plain-text expenses and receipt photos. Try `100 chai via UPI`, or /help for examples.", messageId);
+          return HtmlService.createHtmlOutput("OK");
         }
       } catch (tgErr) {
         logToSheet("🚨 [doPost Telegram Error]: " + tgErr.toString());
@@ -338,8 +358,10 @@ function doPost(e) {
     }
 
     // --- Config API (used by onboarding.sh; auth: secret = bot token) ---
-    // Surface is deliberately tiny: ping (verify a live deploy) + updateConfig
-    // (write one Script Property). No data is readable through this API.
+    // Surface is deliberately tiny: ping (verify a live deploy), updateConfig (write one
+    // Script Property), diagnose (live-check each stored secret — pass/fail only, no values),
+    // installTrigger (install the sync trigger), sync (run pollSplitwise now).
+    // No stored data is readable through this API.
     var secret = update.secret || e.parameter.secret;
     var botToken = getSetting("TELEGRAM_BOT_TOKEN");
 
@@ -351,6 +373,40 @@ function doPost(e) {
 
     if (action === "ping") {
       return ContentService.createTextOutput(JSON.stringify({ ok: true, app: "IronBank", version: IRONBANK_VERSION })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (action === "diagnose") {
+      // Live-check each stored secret so onboarding catches a mistyped Script Property
+      // immediately, instead of a silent first-sync failure. Values never leave Apps Script.
+      var checks = {};
+      try { checks.telegram = UrlFetchApp.fetch("https://api.telegram.org/bot" + getSetting("TELEGRAM_BOT_TOKEN") + "/getMe", { muteHttpExceptions: true }).getResponseCode() === 200; } catch (ed1) { checks.telegram = false; }
+      try { checks.gemini = UrlFetchApp.fetch("https://generativelanguage.googleapis.com/v1beta/models?key=" + getSetting("GEMINI_API_KEY"), { muteHttpExceptions: true }).getResponseCode() === 200; } catch (ed2) { checks.gemini = false; }
+      try { checks.splitwise = UrlFetchApp.fetch("https://secure.splitwise.com/api/v3.0/get_current_user", { headers: { "Authorization": "Bearer " + getSetting("SPLITWISE_TOKEN") }, muteHttpExceptions: true }).getResponseCode() === 200; } catch (ed3) { checks.splitwise = false; }
+      try { var cfgDiag = getNotionConfig(); checks.notion = !!(cfgDiag && notionApi(cfgDiag, "GET", "databases/" + cfgDiag.db.expenses, null)); } catch (ed4) { checks.notion = false; }
+      var allOk = checks.telegram && checks.gemini && checks.splitwise && checks.notion;
+      return ContentService.createTextOutput(JSON.stringify({ ok: allOk, checks: checks })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    if (action === "installTrigger") {
+      // A Web App request executes as the owner — that IS the script's authorized context,
+      // so the sync trigger can be installed right here (idempotently). Removes a manual step.
+      try {
+        var trgs = ScriptApp.getProjectTriggers();
+        for (var ti = 0; ti < trgs.length; ti++) if (trgs[ti].getHandlerFunction() === "pollSplitwise") ScriptApp.deleteTrigger(trgs[ti]);
+        var mins = parseInt(getSetting("POLL_INTERVAL_MIN") || "15", 10);
+        if ([1, 5, 10, 15, 30].indexOf(mins) < 0) mins = 15;   // the only cadences everyMinutes accepts
+        ScriptApp.newTrigger("pollSplitwise").timeBased().everyMinutes(mins).create();
+        return ContentService.createTextOutput(JSON.stringify({ success: true, everyMinutes: mins })).setMimeType(ContentService.MimeType.JSON);
+      } catch (te) {
+        return ContentService.createTextOutput(JSON.stringify({ success: false, error: te.toString() })).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    if (action === "sync") {
+      // Run a sync inline (forced past the change gates) so onboarding can end with
+      // Groups + contacts already sitting in Notion.
+      var syncNow = pollSplitwise({ force: true });
+      return ContentService.createTextOutput(JSON.stringify(syncNow || { ok: false })).setMimeType(ContentService.MimeType.JSON);
     }
 
     if (action === "updateConfig") {
@@ -511,19 +567,20 @@ function processExpenseText(text, geminiKey, token, chatId, messageId, ownerName
     var resObj = JSON.parse(responseText);
     var parsedJson = JSON.parse(resObj.candidates[0].content.parts[0].text);
 
-    // Enforce owner-payer hard limit
-    if (parsedJson.payer.toLowerCase().trim() !== ownerName.toLowerCase().trim()) {
-      logToSheet("⚠️ [processExpenseText] Blocked transaction: Payer is not the owner. Payer: " + parsedJson.payer + ", Owner: " + ownerName);
-      sendTelegramMessage(token, chatId, "❌ **Not logged — you weren't the payer.**\nIronBank only records expenses **" + ownerName + "** paid (this is what prevents duplicate Splitwise entries when several people run IronBank).\n\nSince **" + parsedJson.payer + "** paid: ask them to log it on their IronBank, or add it directly in Splitwise — either way it lands in your Notion automatically on the next sync.", messageId, "Markdown");
-      return;
-    }
-
     // R10 — evaluate arithmetic in code (Gemini returns the raw expression); fall back to its number.
     var rawTotal = safeEvalArithmetic_(parsedJson.total_amount_raw);
     if (isFinite(rawTotal) && rawTotal > 0) parsedJson.total_amount = rawTotal;
     if (parsedJson.fixed_splits) for (var fx = 0; fx < parsedJson.fixed_splits.length; fx++) {
       var fev = safeEvalArithmetic_(parsedJson.fixed_splits[fx].amount);
       if (isFinite(fev)) parsedJson.fixed_splits[fx].amount = fev;
+    }
+
+    // Fixed amounts at/over the total would silently drop the "split the rest" people — refuse.
+    var planErr = checkFixedVsTotal_(parsedJson);
+    if (planErr) {
+      logToSheet("⚠️ [processExpenseText] Blocked: fixed splits >= total with weighted participants.");
+      sendTelegramMessage(token, chatId, planErr, messageId, "Markdown");
+      return;
     }
 
     // Calculate exact splits programmatically using JS
@@ -536,6 +593,14 @@ function processExpenseText(text, geminiKey, token, chatId, messageId, ownerName
     if (cfg14) {
       try { resolution = resolveNames_(cfg14, parsedJson, ownerName, peopleRows); applyResolution_(parsedJson, resolution); }
       catch (rerr) { logToSheet("§14 resolve error: " + rerr); }
+    }
+
+    // Enforce owner-payer hard limit — AFTER resolution, so a nickname/short form of the
+    // owner's own name compares in canonical form instead of falsely blocking.
+    if ((parsedJson.payer || "").toLowerCase().trim() !== ownerName.toLowerCase().trim()) {
+      logToSheet("⚠️ [processExpenseText] Blocked transaction: Payer is not the owner. Payer: " + parsedJson.payer + ", Owner: " + ownerName);
+      sendTelegramMessage(token, chatId, "❌ **Not logged — you weren't the payer.**\nIronBank only records expenses **" + ownerName + "** paid (this is what prevents duplicate Splitwise entries when several people run IronBank).\n\nSince **" + parsedJson.payer + "** paid: ask them to log it on their IronBank, or add it directly in Splitwise — either way it lands in your Notion automatically on the next sync.", messageId, "Markdown");
+      return;
     }
     // R10 — do the splits tally to the total? (calculateSplits distributes to match; a miss = parse error.)
     var sumWarn = checkSplitSum_(parsedJson.splits, parsedJson.total_amount) ? "" : "\n\n⚠️ *Split total doesn't match the amount — please double-check.*";
@@ -817,13 +882,6 @@ function processReceiptPhoto(photoArray, caption, geminiKey, token, chatId, mess
     var parsedJson = JSON.parse(resObj.candidates[0].content.parts[0].text);
     logToSheet("📷 [processReceiptPhoto] Extracted Data: " + JSON.stringify(parsedJson));
 
-    // Enforce owner-payer hard limit
-    if (parsedJson.payer.toLowerCase().trim() !== ownerName.toLowerCase().trim()) {
-      logToSheet("⚠️ [processReceiptPhoto] Blocked transaction: Payer is not the owner. Payer: " + parsedJson.payer + ", Owner: " + ownerName);
-      sendTelegramMessage(token, chatId, "❌ **Not logged — you weren't the payer.**\nIronBank only records expenses **" + ownerName + "** paid (this is what prevents duplicate Splitwise entries when several people run IronBank).\n\nSince **" + parsedJson.payer + "** paid: ask them to log it on their IronBank, or add it directly in Splitwise — either way it lands in your Notion automatically on the next sync.", messageId, "Markdown");
-      return;
-    }
-
     // Check if invalid receipt
     if (parsedJson.total_amount === 0 || parsedJson.description === "Invalid Receipt") {
       logToSheet("📷 [processReceiptPhoto] Error: Parsed total is 0 or 'Invalid Receipt' flagged");
@@ -839,6 +897,14 @@ function processReceiptPhoto(photoArray, caption, geminiKey, token, chatId, mess
       if (isFinite(fev)) parsedJson.fixed_splits[fx].amount = fev;
     }
 
+    // Fixed amounts at/over the total would silently drop the "split the rest" people — refuse.
+    var planErr = checkFixedVsTotal_(parsedJson);
+    if (planErr) {
+      logToSheet("⚠️ [processReceiptPhoto] Blocked: fixed splits >= total with weighted participants.");
+      sendTelegramMessage(token, chatId, planErr, messageId, "Markdown");
+      return;
+    }
+
     // Calculate exact splits programmatically using JS
     parsedJson.splits = calculateSplits(parsedJson);
     logToSheet("⚖️ [processReceiptPhoto] Programmatically calculated splits: " + JSON.stringify(parsedJson.splits));
@@ -849,6 +915,14 @@ function processReceiptPhoto(photoArray, caption, geminiKey, token, chatId, mess
     if (cfg14) {
       try { resolution = resolveNames_(cfg14, parsedJson, ownerName, peopleRows); applyResolution_(parsedJson, resolution); }
       catch (rerr) { logToSheet("§14 resolve error: " + rerr); }
+    }
+
+    // Enforce owner-payer hard limit — AFTER resolution, so a nickname/short form of the
+    // owner's own name compares in canonical form instead of falsely blocking.
+    if ((parsedJson.payer || "").toLowerCase().trim() !== ownerName.toLowerCase().trim()) {
+      logToSheet("⚠️ [processReceiptPhoto] Blocked transaction: Payer is not the owner. Payer: " + parsedJson.payer + ", Owner: " + ownerName);
+      sendTelegramMessage(token, chatId, "❌ **Not logged — you weren't the payer.**\nIronBank only records expenses **" + ownerName + "** paid (this is what prevents duplicate Splitwise entries when several people run IronBank).\n\nSince **" + parsedJson.payer + "** paid: ask them to log it on their IronBank, or add it directly in Splitwise — either way it lands in your Notion automatically on the next sync.", messageId, "Markdown");
+      return;
     }
     var sumWarn = checkSplitSum_(parsedJson.splits, parsedJson.total_amount) ? "" : "\n\n⚠️ *Split total doesn't match the amount — please double-check.*";
 
@@ -1363,8 +1437,9 @@ function writeToNotion(data, source, ownerName, splitsSummary) {
     props["Splitwise Group ID"] = { rich_text: [{ text: { content: data.splitwise_group_id.toString() } }] };
   }
   if (data.splitwise_updated_at) {
-    // Stamp the push's updated_at so the poller sees "no change" on its first pass and preserves
-    // Source (Telegram/Manual). A genuine later Splitwise edit changes updated_at → poller updates → Splitwise.
+    // Stamp the push's updated_at so the poller sees "no change" on its first pass. A genuine later
+    // Splitwise edit changes updated_at → the poller updates amounts/splits (category, payment mode
+    // and Source are create-only on the poller side, so they survive).
     props["Splitwise Updated At"] = { rich_text: [{ text: { content: data.splitwise_updated_at.toString() } }] };
   }
 
@@ -1407,6 +1482,7 @@ var POLL_INCREMENTAL_CAP = 200;         // max expenses per group per run; water
 // §13c backfill-on-Allowed: one-time full-history pull, batched across runs to stay under the 6-min cap.
 var POLL_BACKFILL_PAGE = 50;    // get_expenses page size
 var POLL_BACKFILL_BATCH = 150;  // max expenses backfilled per group per run (yields to the live poll)
+var POLL_BUDGET_MS = 270000;    // soft deadline ~4.5 min into the 6-min cap; remaining work resumes next run
 // R6: {swid -> global INR net, groupText} built once per poll run from get_friends; read by pollUpsertPerson_.
 var POLL_FRIEND_NET = null;
 
@@ -1416,6 +1492,13 @@ function pollTodayIso_() {
 
 function pollNowIso_() {
   return Utilities.formatDate(new Date(), "GMT", "yyyy-MM-dd'T'HH:mm:ss'Z'");
+}
+
+// Watermark value for updated_after scans: now minus a 60s overlap, so an expense whose
+// updated_at commits while a scan is in flight isn't lost forever. Re-seeing an expense is
+// free — the updated_at gate in pollUpsertExpense_ skips it.
+function pollWatermarkIso_() {
+  return Utilities.formatDate(new Date(Date.now() - 60000), "GMT", "yyyy-MM-dd'T'HH:mm:ss'Z'");
 }
 
 // §13b/§17 — resolve a push plan by partitioning non-owner participants by their People.Default Group.
@@ -1443,7 +1526,7 @@ function resolvePushPlanForParticipants_(cfg, parsed, ownerName, peopleRows) {
   // People routing: name+alias(lower) -> {swid, gid, name}. Readiness ⇔ has a Splitwise User ID;
   // an Allowed Default Group routes into that group, otherwise the direct (non-group) bucket.
   var rows = peopleRows || fetchPeople_(cfg);
-  var routing = {};
+  var routing = {}, collidingKey = {};
   for (var p = 0; p < rows.length; p++) {
     var ginfo = rows[p].defaultGroupPageId ? groupsByPage[rows[p].defaultGroupPageId] : null;
     var entry = { swid: rows[p].swid, gid: (ginfo && ginfo.allowed) ? ginfo.gid : null, name: rows[p].name };
@@ -1451,7 +1534,12 @@ function resolvePushPlanForParticipants_(cfg, parsed, ownerName, peopleRows) {
     if (rows[p].aliases) { var av = rows[p].aliases.split(","); for (var ai = 0; ai < av.length; ai++) keys.push(av[ai]); }
     for (var ki = 0; ki < keys.length; ki++) {
       var kk = (keys[ki] || "").toLowerCase().replace(/^\s+|\s+$/g, "");
-      if (kk && !routing[kk]) routing[kk] = entry;
+      if (!kk) continue;
+      if (!routing[kk]) routing[kk] = entry;
+      // saveAlias_ enforces alias uniqueness, but a manual Notion edit can still put the same
+      // name/alias on two people. First-wins routing would then push money to whichever row was
+      // scanned first — mark the key so the expense parks with a clear reason instead.
+      else if (routing[kk].name !== entry.name) collidingKey[kk] = true;
     }
   }
 
@@ -1459,6 +1547,7 @@ function resolvePushPlanForParticipants_(cfg, parsed, ownerName, peopleRows) {
   for (var s = 0; s < splits.length; s++) {
     var nml = (splits[s].name || "").toString().toLowerCase().replace(/^\s+|\s+$/g, "");
     if (NOTION_OWNER_ALIASES[nml] === 1 || nml === ownerLower) continue; // owner share stays Notion-only
+    if (collidingKey[nml]) return { park: "'" + splits[s].name + "' matches more than one person in Notion (duplicate name/alias) — fix Aliases or use Merge Into" };
     var r = routing[nml];
     if (!r || !r.swid) return { park: "'" + splits[s].name + "' not resolved (no Splitwise ID)" };
     var bucket = r.gid || 0;
@@ -1837,6 +1926,16 @@ function pollUpsertSwUsers_(cfg, token, groupsResp, friends) {
 // the People row so all routing/readiness code (which reads the number) keeps working unchanged.
 function pollSyncPeopleIdentity_(cfg) {
   if (!cfg.db.swusers) return;
+  // People side first — when nobody has picked an identity yet, skip the contacts scan entirely.
+  var people = [], c2 = null;
+  do {
+    var b2 = { page_size: 100, filter: { property: "Splitwise Identity", relation: { is_not_empty: true } } };
+    if (c2) b2.start_cursor = c2;
+    var pr = pollNotion_(cfg, "POST", "databases/" + cfg.db.people + "/query", b2);
+    for (var p = 0; p < pr.results.length; p++) people.push(pr.results[p]);
+    c2 = pr.has_more ? pr.next_cursor : null;
+  } while (c2);
+  if (!people.length) return;
   var byPage = {}, c1 = null;
   do {
     var b = { page_size: 100 }; if (c1) b.start_cursor = c1;
@@ -1847,32 +1946,38 @@ function pollSyncPeopleIdentity_(cfg) {
     };
     c1 = r.has_more ? r.next_cursor : null;
   } while (c1);
-  var c2 = null;
-  do {
-    var b2 = { page_size: 100, filter: { property: "Splitwise Identity", relation: { is_not_empty: true } } };
-    if (c2) b2.start_cursor = c2;
-    var pr = pollNotion_(cfg, "POST", "databases/" + cfg.db.people + "/query", b2);
-    for (var p = 0; p < pr.results.length; p++) {
-      var rel = (pr.results[p].properties["Splitwise Identity"].relation) || [];
-      if (!rel.length) continue;
-      var link = byPage[rel[0].id];
-      if (!link || link.swid == null) continue;
-      var curId = pr.results[p].properties["Splitwise User ID"] && pr.results[p].properties["Splitwise User ID"].number;
-      var curName = pollRichText_(pr.results[p].properties["Splitwise Name"]);
-      if (curId !== link.swid || curName !== link.name)
-        pollNotion_(cfg, "PATCH", "pages/" + pr.results[p].id, { properties: {
-          "Splitwise User ID": { number: link.swid },
-          "Splitwise Name": { rich_text: [{ text: { content: link.name } }] }
-        } });
-    }
-    c2 = pr.has_more ? pr.next_cursor : null;
-  } while (c2);
+  for (var p2 = 0; p2 < people.length; p2++) {
+    var rel = (people[p2].properties["Splitwise Identity"].relation) || [];
+    if (!rel.length) continue;
+    var link = byPage[rel[0].id];
+    if (!link || link.swid == null) continue;
+    var curId = people[p2].properties["Splitwise User ID"] && people[p2].properties["Splitwise User ID"].number;
+    var curName = pollRichText_(people[p2].properties["Splitwise Name"]);
+    if (curId !== link.swid || curName !== link.name)
+      pollNotion_(cfg, "PATCH", "pages/" + people[p2].id, { properties: {
+        "Splitwise User ID": { number: link.swid },
+        "Splitwise Name": { rich_text: [{ text: { content: link.name } }] }
+      } });
+  }
 }
 
 // §17 — auto-link every Splitwise-backed People row to its Splitwise Users contact (matched by swid),
 // so the relation is always populated (navigation + rollups). Only patches rows missing the link.
 function pollLinkPeopleIdentity_(cfg) {
   if (!cfg.db.swusers) return;
+  // People side first — in steady state nobody needs linking, so the contacts scan is skipped.
+  var needLink = [], c2 = null;
+  do {
+    var b2 = { page_size: 100, filter: { and: [
+      { property: "Splitwise User ID", number: { is_not_empty: true } },
+      { property: "Splitwise Identity", relation: { is_empty: true } }
+    ] } };
+    if (c2) b2.start_cursor = c2;
+    var pr = pollNotion_(cfg, "POST", "databases/" + cfg.db.people + "/query", b2);
+    for (var p = 0; p < pr.results.length; p++) needLink.push(pr.results[p]);
+    c2 = pr.has_more ? pr.next_cursor : null;
+  } while (c2);
+  if (!needLink.length) return;
   var bySwid = {}, c1 = null;
   do {
     var b = { page_size: 100 }; if (c1) b.start_cursor = c1;
@@ -1883,20 +1988,10 @@ function pollLinkPeopleIdentity_(cfg) {
     }
     c1 = r.has_more ? r.next_cursor : null;
   } while (c1);
-  var c2 = null;
-  do {
-    var b2 = { page_size: 100, filter: { and: [
-      { property: "Splitwise User ID", number: { is_not_empty: true } },
-      { property: "Splitwise Identity", relation: { is_empty: true } }
-    ] } };
-    if (c2) b2.start_cursor = c2;
-    var pr = pollNotion_(cfg, "POST", "databases/" + cfg.db.people + "/query", b2);
-    for (var p = 0; p < pr.results.length; p++) {
-      var contact = bySwid[pr.results[p].properties["Splitwise User ID"].number];
-      if (contact) pollNotion_(cfg, "PATCH", "pages/" + pr.results[p].id, { properties: { "Splitwise Identity": { relation: [{ id: contact }] } } });
-    }
-    c2 = pr.has_more ? pr.next_cursor : null;
-  } while (c2);
+  for (var n = 0; n < needLink.length; n++) {
+    var contact = bySwid[needLink[n].properties["Splitwise User ID"].number];
+    if (contact) pollNotion_(cfg, "PATCH", "pages/" + needLink[n].id, { properties: { "Splitwise Identity": { relation: [{ id: contact }] } } });
+  }
 }
 
 // §17 — process Merge Into: fold a stray person into the target (aliases + repoint expenses + archive).
@@ -1910,6 +2005,19 @@ function pollProcessMerges_(cfg) {
       var row = r.results[i], rel = (row.properties["Merge Into"].relation) || [];
       if (!rel.length || rel[0].id === row.id) continue;
       var targetId = rel[0].id, strayName = pollRichText_(row.properties["Name"]);
+      // Follow chains (A→B while B→C is flagged in the same run): merge A straight into the
+      // final target, or PATCHing an already-archived intermediate would 400. Cycle-guarded.
+      var seenIds = {}; seenIds[row.id] = true;
+      for (var hop = 0; hop < 5; hop++) {
+        if (seenIds[targetId]) break;
+        seenIds[targetId] = true;
+        var tpage;
+        try { tpage = pollNotion_(cfg, "GET", "pages/" + targetId, null); } catch (tpe) { break; }
+        var trel = (tpage.properties["Merge Into"] && tpage.properties["Merge Into"].relation) || [];
+        if (!trel.length || trel[0].id === targetId || seenIds[trel[0].id]) break;
+        targetId = trel[0].id;
+      }
+      if (targetId === row.id) continue;   // chain looped back to the stray itself
       var strayAliases = pollRichText_(row.properties["Aliases"]);
       mergeStrayPerson_(cfg, row.id, targetId, idName[targetId] || "", strayName);
       if (strayAliases) { var av = strayAliases.split(","); for (var a = 0; a < av.length; a++) { var al = av[a].replace(/^\s+|\s+$/g, ""); if (al) saveAlias_(cfg, targetId, al); } }
@@ -1928,7 +2036,7 @@ function pollNonGroupExpenses_(cfg, token, ownerId, ownerName, friends) {
   var sinceKey = "POLL_NONGROUP_UPDATED_AFTER";
   var props = PropertiesService.getScriptProperties();
   var since = props.getProperty(sinceKey);          // null on first run → full backfill
-  var runStart = pollNowIso_();
+  var runStart = pollWatermarkIso_();               // 60s overlap; the updated_at gate dedups
   // expense.users[].user lacks email; source it from get_friends (which has it) so People get an Email.
   var emailBy = {};
   friends = friends || [];
@@ -2079,12 +2187,21 @@ function pollBackfillGroup_(cfg, token, gid, ownerId, idToName, memberById, pers
 }
 
 // §13b — dedup by `contains` (not `equals`) so a composite row (Splitwise ID = "idA,idB") is found
-// by either of its IDs. Note: Splitwise ids are plain integers, so a substring collision is possible
-// in principle (ids of different lengths); contemporaneous ids are same-length, making it negligible.
+// by either of its IDs. `contains` is a substring match ("123" also matches "4123"), so every
+// candidate is verified in code for exact membership in its comma list — returning a substring
+// collision here would PATCH the wrong row with this expense's data.
 function pollFindExpense_(cfg, swid) {
   var r = pollNotion_(cfg, "POST", "databases/" + cfg.db.expenses + "/query",
     { filter: { property: "Splitwise ID", rich_text: { contains: String(swid) } } });
-  return (r.results && r.results.length) ? r.results[0] : null;
+  var want = String(swid);
+  var results = (r.results || []);
+  for (var i = 0; i < results.length; i++) {
+    var ids = pollRichText_(results[i].properties["Splitwise ID"]).split(",");
+    for (var j = 0; j < ids.length; j++) {
+      if (ids[j].replace(/^\s+|\s+$/g, "") === want) return results[i];
+    }
+  }
+  return null;
 }
 
 // Upsert one Splitwise expense into Notion. Returns "create" | "update" | "archive" | "skip".
@@ -2162,9 +2279,6 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
     "Description": { title: [{ text: { content: desc } }] },
     "Amount": { number: Math.round(ownerShare * 100) / 100 },
     "Total Amount": { number: Math.round(cost * 100) / 100 },
-    "Expense Type": { select: { name: "Other" } },
-    "Payment Mode": { select: { name: "Unknown" } },
-    "Source": { select: { name: "Splitwise" } },
     "Settlement Status": { select: { name: "Settled-via-Splitwise" } },
     "Splits Summary": { rich_text: rtChunks_(summaryParts.join(", ")) },
     "Splitwise ID": { rich_text: [{ text: { content: String(swid) } }] },
@@ -2179,9 +2293,15 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
 
   // §15: single page write per expense — Participants + Splits Data replace the per-person Splits rows.
   if (page) {
+    // Update path deliberately writes only the fields Splitwise owns (amounts, splits, date, ids).
+    // Expense Type / Payment Mode / Source are curated by the bot or the user — a later Splitwise
+    // edit must not reset a categorized row to "Other"/"Unknown".
     pollNotion_(cfg, "PATCH", "pages/" + page.id, { properties: props });
     return "update";
   }
+  props["Expense Type"] = { select: { name: "Other" } };
+  props["Payment Mode"] = { select: { name: "Unknown" } };
+  props["Source"] = { select: { name: "Splitwise" } };
   pollNotion_(cfg, "POST", "pages", { parent: { database_id: cfg.db.expenses }, properties: props });
   return "create";
 }
@@ -2259,6 +2379,17 @@ function pollRetryNeedsMapping_(cfg, token, ownerName) {
   for (var pi = 0; pi < peopleRows.length; pi++) idName[peopleRows[pi].pageId] = peopleRows[pi].name;
   var pushed = 0;
   for (var i = 0; i < rows.length; i++) {
+    // Guard: a "Needs mapping" row that already carries Splitwise IDs (shouldn't happen, but a
+    // manual status edit or the pick_ flow could produce it) must not be pushed again — that
+    // would create a duplicate Splitwise expense and orphan the first.
+    var existingIds = pollRichText_(rows[i].properties["Splitwise ID"]);
+    if (existingIds) {
+      var dupNote = "already on Splitwise (" + existingIds + ") — not re-pushed; use Sync Action → Re-push to rebuild it";
+      if (pollRichText_(rows[i].properties["Sync Status"]) !== dupNote) {
+        pollNotion_(cfg, "PATCH", "pages/" + rows[i].id, { properties: { "Sync Status": { rich_text: [{ text: { content: dupNote } }] } } });
+      }
+      continue;
+    }
     var parsed = pollReconstructExpense_(cfg, rows[i], idName);
     // owner-payer invariant: only the payer's instance creates the Splitwise expense
     if ((parsed.payer || "").toLowerCase().replace(/^\s+|\s+$/g, "") !== ownerName.toLowerCase().replace(/^\s+|\s+$/g, "")) continue;
@@ -2376,6 +2507,7 @@ function pollSplitwise(opts) {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(2000)) { logToSheet("pollSplitwise: lock busy, skipping this run."); return { ok: false, reason: "lock busy" }; }
   POLL_FRIEND_NET = null;  // R6: rebuilt each run from get_friends
+  var pollStart = Date.now();   // soft time budget — stop cleanly instead of being killed at 6 min
   try {
     var cfg = getNotionConfig();
     if (!cfg || !cfg.db.groups) { logToSheet("pollSplitwise: Notion (or Groups DB) not configured, skipping."); return { ok: false, reason: "notion not configured" }; }
@@ -2435,8 +2567,15 @@ function pollSplitwise(opts) {
 
     // §13.3 — the allowed set is controlled in Notion (Groups.Allowed).
     var allowed = pollGetAllowedGroups_(cfg);
-    var created = 0, updated = 0, archived = 0, skippedGroups = 0, backfilling = 0;
+    var created = 0, updated = 0, archived = 0, skippedGroups = 0, backfilling = 0, budgetHit = false;
     for (var gi = 0; gi < allowed.length; gi++) {
+      if (Date.now() - pollStart > POLL_BUDGET_MS) {
+        // Watermarks / backfill cursors only advance on completed scans, so stopping here is
+        // safe — the remaining groups simply resume on the next run.
+        logToSheet("pollSplitwise: time budget hit — remaining groups resume next run.");
+        budgetHit = true;
+        break;
+      }
       var aentry = allowed[gi];
       var gid = aentry.gid;
       var g = gmeta[gid];
@@ -2471,8 +2610,8 @@ function pollSplitwise(opts) {
         created += bf.created; updated += bf.updated; archived += bf.archived;
         if (bf.done) {
           pollNotion_(cfg, "PATCH", "pages/" + aentry.pageId, { properties: { "Backfilled": { checkbox: true } } });
-          scriptProps.setProperty(propKey, swUpdated);          // caught up → change-gated incremental from here
-          scriptProps.setProperty(sinceKey, pollNowIso_());     // incremental picks up from the end of backfill
+          scriptProps.setProperty(propKey, swUpdated);              // caught up → change-gated incremental from here
+          scriptProps.setProperty(sinceKey, pollWatermarkIso_());   // incremental picks up from the end of backfill (60s overlap)
           logToSheet("pollSplitwise: backfill COMPLETE for " + g.name + " (" + bf.processed + " this run)");
         } else {
           backfilling++;  // more history remains — continues next cycle from the saved offset
@@ -2485,7 +2624,7 @@ function pollSplitwise(opts) {
       // deletions of arbitrarily old expenses are caught no matter how deep they sit. The gate
       // and the watermark only advance when the scan drained, so a capped run resumes next cycle.
       var since = scriptProps.getProperty(sinceKey);
-      var runStart = pollNowIso_();
+      var runStart = pollWatermarkIso_();   // 60s overlap; the updated_at gate dedups
       var fetched = 0, goffset = 0, drained = true;
       while (true) {
         var q = { group_id: gid, limit: POLL_MAX_EXPENSES_PER_GROUP, offset: goffset };
@@ -2506,13 +2645,19 @@ function pollSplitwise(opts) {
       }
     }
 
-    // Outward passes (cheap when nothing is flagged).
-    var retried = pollRetryNeedsMapping_(cfg, token, ownerName);
-    var sa = pollProcessSyncActions_(cfg, token, ownerName);
+    // Outward passes (cheap when nothing is flagged; skipped when over budget — next run catches up).
+    var retried = 0, sa = { del: 0, rep: 0 };
+    if (Date.now() - pollStart <= POLL_BUDGET_MS) {
+      retried = pollRetryNeedsMapping_(cfg, token, ownerName);
+      sa = pollProcessSyncActions_(cfg, token, ownerName);
+    } else {
+      budgetHit = true;
+      logToSheet("pollSplitwise: time budget hit — outward passes deferred to next run.");
+    }
 
     var result = { ok: true, created: created + ng.created, updated: updated + ng.updated, archived: archived + ng.archived,
                    skippedGroups: skippedGroups, backfilling: backfilling, allowedGroups: allowed.length, forced: !!force,
-                   nonGroup: ng, retried: retried, deleted: sa.del, rePushed: sa.rep };
+                   nonGroup: ng, retried: retried, deleted: sa.del, rePushed: sa.rep, budgetHit: budgetHit };
     scriptProps.setProperty("POLL_LAST_RUN", pollNowIso_());   // read by the /status command
     logToSheet("pollSplitwise done: " + JSON.stringify(result));
     return result;
@@ -2618,7 +2763,8 @@ function handleCommands(commandText, token, chatId, messageId) {
       "/settle — who owes whom right now\n" +
       "/sync — run the Splitwise↔Notion sync now\n" +
       "/status — last sync + what needs your attention\n" +
-      "/help — this guide";
+      "/help — this guide\n\n" +
+      "Made a mistake? Tap 🗑️ Delete on my reply and re-send — or set `Sync Action` → `Re-push` on the row in Notion to rebuild the Splitwise side.";
     sendTelegramMessage(token, chatId, welcome, messageId);
 
   } else if (cmd === "/report") {
@@ -2646,6 +2792,9 @@ function handleCommands(commandText, token, chatId, messageId) {
 
   } else if (cmd === "/status") {
     sendTelegramMessage(token, chatId, cmdStatus_(cfg), messageId);
+
+  } else {
+    sendTelegramMessage(token, chatId, "🤷 Unknown command. Try /help.", messageId);
   }
 }
 
@@ -2713,24 +2862,44 @@ function cmdSettle_(cfg) {
   return reply;
 }
 
-// /status — last sync + counts of things awaiting the user.
+// /status — last sync + counts of things awaiting the user + in-progress backfills.
 function cmdStatus_(cfg) {
   if (!cfg) return "⚠️ Notion isn't configured.";
   var last = getSetting("POLL_LAST_RUN") || "never";
-  var parked = 0, actions = 0;
+  var parked = "0", actions = "0";
   try {
-    parked = pollNotion_(cfg, "POST", "databases/" + cfg.db.expenses + "/query",
-      { page_size: 100, filter: { property: "Settlement Status", select: { equals: "Needs mapping" } } }).results.length;
-    actions = pollNotion_(cfg, "POST", "databases/" + cfg.db.expenses + "/query",
+    var pq = pollNotion_(cfg, "POST", "databases/" + cfg.db.expenses + "/query",
+      { page_size: 100, filter: { property: "Settlement Status", select: { equals: "Needs mapping" } } });
+    parked = pq.results.length + (pq.has_more ? "+" : "");
+    var aq = pollNotion_(cfg, "POST", "databases/" + cfg.db.expenses + "/query",
       { page_size: 100, filter: { or: [
         { property: "Sync Action", select: { equals: "Delete" } },
         { property: "Sync Action", select: { equals: "Re-push" } }
-      ] } }).results.length;
+      ] } });
+    actions = aq.results.length + (aq.has_more ? "+" : "");
   } catch (e) { logToSheet("cmdStatus_ err: " + e); }
+  // §13c — surface in-progress backfills so "where are my old expenses?" answers itself.
+  var backfills = "";
+  try {
+    var allProps = PropertiesService.getScriptProperties().getProperties();
+    var bf = [];
+    for (var k in allProps) {
+      if (k.indexOf("POLL_BACKFILL_OFFSET_") !== 0) continue;
+      var gid = k.substring("POLL_BACKFILL_OFFSET_".length);
+      var gname = "group " + gid;
+      try {
+        var gq = pollNotion_(cfg, "POST", "databases/" + cfg.db.groups + "/query",
+          { filter: { property: "Splitwise Group ID", number: { equals: parseInt(gid, 10) } } });
+        if (gq.results.length) gname = pollRichText_(gq.results[0].properties["Name"]) || gname;
+      } catch (ge) {}
+      bf.push(gname + " (" + allProps[k] + " imported so far)");
+    }
+    if (bf.length) backfills = "\nBackfill in progress: " + bf.join(", ");
+  } catch (e2) { logToSheet("cmdStatus_ backfill err: " + e2); }
   return "🩺 **Status**\n" +
-         "Last sync: " + last + " (runs every ~15 min; /sync runs it now)\n" +
-         "Parked expenses (Needs mapping): " + parked + (parked ? " — set the person up in Notion → People" : "") + "\n" +
-         "Pending sync actions: " + actions;
+         "Last sync: " + last + " (/sync runs it now)\n" +
+         "Parked expenses (Needs mapping): " + parked + (parked !== "0" ? " — set the person up in Notion → People" : "") + "\n" +
+         "Pending sync actions: " + actions + backfills;
 }
 
 // ==========================================

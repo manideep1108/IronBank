@@ -7,33 +7,38 @@
 #
 #  What this script DOES (automated):
 #    1. Collects + live-validates all four credentials
-#       (Telegram bot token, Gemini key, Splitwise PAT, Notion token+page).
+#       (Telegram bot token, Gemini key, Splitwise PAT, Notion token+page)
+#       and pins your Telegram chat id (required — prevents bot hijack).
 #    2. Provisions the 4 Notion databases (Expenses / People / Groups /
 #       Splitwise Users) IDEMPOTENTLY — including the Month/Year formulas,
 #       all relations, and the seeded Expense Type / Payment Mode options
-#       that drive the parser. Re-running finds existing databases by title
-#       and only adds what's missing.
+#       that drive the parser. Re-runs prefer the database ids saved in the
+#       state file (survives renames), then fall back to title matching.
 #    3. After you deploy the Apps Script Web App, pushes all NON-SECRET
-#       config (owner name, Notion database ids, chat id) into Apps Script
-#       Script Properties through the Web App's own updateConfig action,
-#       and registers the Telegram webhook.
-#    4. Verifies the deploy (ping) and the webhook (getWebhookInfo).
+#       config into Script Properties through the Web App's updateConfig
+#       action, and registers the Telegram webhook.
+#    4. LIVE-VERIFIES every secret you pasted (diagnose — pass/fail only,
+#       values never leave Apps Script), INSTALLS the 15-min sync trigger
+#       through the Web App, and RUNS THE FIRST SYNC so your Splitwise
+#       groups and contacts are already in Notion when you open it.
 #
 #  What it CANNOT automate (guided manual steps — no API exists for them):
-#    A. Creating the Apps Script project (script.new) + pasting the loader.
+#    A. Creating the Apps Script project (script.new) + pasting the loader
+#       (this script copies the loader to your clipboard when it can).
 #    B. Setting the four SECRETS in Script Properties (Google offers no
 #       public API for Script Properties — and that's where secrets belong).
 #    C. Deploying the Web App (interactive Google authorization).
-#    D. Running installPollTrigger once in the Apps Script editor (triggers
-#       can only be created from the script's own authorized context).
-#    E. Sharing the Notion parent page with your integration.
-#    F. Building the Notion VIEWS — the Notion API cannot create views.
-#       Follow DASHBOARD.md (or the hosted Build Guide) once at the end.
+#    D. Sharing the Notion parent page with your integration.
+#    E. Building the Notion VIEWS — the Notion API cannot create views.
+#       Follow dashboard_build_guide.html (or DASHBOARD.md) once at the end.
 #
 #  There is NO Google Sheet in IronBank: all config lives in Script
 #  Properties, logs live in the Apps Script execution log.
 #
-#  Requirements: bash, curl, python3 (Git Bash on Windows works).
+#  Requirements: bash, curl, python3.
+#  Windows: run this inside Git Bash (ships with Git for Windows) or WSL —
+#  see "Running on Windows" in README.md. There is no separate .ps1/.bat
+#  version; this script IS the Windows onboarding, via Git Bash.
 #  Safe to re-run at any point; never prints secrets unless you ask.
 # ============================================================================
 set -euo pipefail
@@ -48,8 +53,16 @@ warn()  { printf '  \033[33m!\033[0m %s\n' "$*"; }
 die()   { printf '  \033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 pause() { printf '\n'; read -r -p "  ↩  Press Enter when done... " _; }
 
-PY="$(command -v python3 || command -v python || true)"
-[ -n "$PY" ] || die "python3 is required (used for the Notion provisioning step)."
+# Find a Python that actually runs. On Windows, `python` can resolve to the Microsoft Store
+# stub (which opens a browser and exits non-zero) — so test-run each candidate instead of
+# trusting `command -v` alone.
+PY=""
+for cand in python3 python py; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import sys" >/dev/null 2>&1; then
+    PY="$cand"; break
+  fi
+done
+[ -n "$PY" ] || die "python3 is required (used for the Notion provisioning step). On Windows: install it from python.org and tick 'Add python.exe to PATH'."
 command -v curl >/dev/null || die "curl is required."
 
 # Prompt that prefers an already-exported env var (lets you script/re-run this).
@@ -108,7 +121,7 @@ s=re.sub(r"[^0-9a-fA-F]","",sys.argv[1])[-32:]
 print(f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:32]}" if len(s)==32 else sys.argv[1])' "$NOTION_PARENT_PAGE_ID")
 curl -sf -H "Authorization: Bearer ${NOTION_TOKEN}" -H "Notion-Version: 2022-06-28" \
   "https://api.notion.com/v1/pages/${NOTION_PARENT_PAGE_ID}" >/dev/null \
-  || die "Notion can't read that page — wrong id, or the page isn't shared with the integration (manual step E)."
+  || die "Notion can't read that page — wrong id, or the page isn't shared with the integration (manual step D)."
 ok "Notion token + parent page verified"
 
 # Owner name: what 'me/I/my' resolve to. Default = Splitwise first name so the
@@ -117,20 +130,32 @@ read -r -p "  Your name as the bot should know you [${SW_FIRST:-Owner}]: " OWNER
 OWNER_NAME="${OWNER_NAME:-${SW_FIRST:-Owner}}"
 ok "Owner name: ${OWNER_NAME}"
 
-# STRONGLY recommended: pre-pin your Telegram chat id. Without it, the FIRST chat
-# that messages the bot auto-registers as the owner — anyone who finds your bot's
-# username before you message it would own your instance.
+# REQUIRED: pin your Telegram chat id. Without a pin, the FIRST chat that messages the
+# bot auto-registers as the owner — anyone who finds your bot's username before you
+# message it would own your instance. 30 seconds to fetch, permanent protection.
 echo
-echo "  (Recommended) Pre-pin your Telegram chat id so nobody can hijack the bot before"
-echo "  your first message. Get your numeric id from @userinfobot. Leave blank to skip."
-read -r -p "  Your Telegram chat id (optional): " TELEGRAM_CHAT_ID || true
+echo "  Pin your Telegram chat id (required — prevents anyone else claiming your bot)."
+echo "  Get your numeric id by messaging @userinfobot on Telegram."
+if [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+  ok "Telegram chat id — using value from \$TELEGRAM_CHAT_ID"
+else
+  while :; do
+    read -r -p "  Your Telegram chat id (numeric): " TELEGRAM_CHAT_ID
+    case "$TELEGRAM_CHAT_ID" in
+      ''|-|*[!0-9-]*) warn "That doesn't look like a numeric chat id (e.g. 123456789) — try again." ;;
+      *) break ;;
+    esac
+  done
+fi
+ok "Chat id pinned: ${TELEGRAM_CHAT_ID}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 bold "STEP 2/6 — Provision the 4 Notion databases (idempotent)"
 # ─────────────────────────────────────────────────────────────────────────────
 # Creates Groups → Splitwise Users → People → Expenses under the parent page
 # (creation order matters: relations need the target database id to exist).
-# Re-run behaviour: finds existing child databases by exact title, then PATCHes
+# Re-run behaviour: prefers the database ids saved in the state file (survives
+# renames), then finds existing child databases by exact title, and PATCHes
 # in any missing properties. Select options are seeded only when the property
 # itself is created — after that the live dropdowns are YOURS: adding an option
 # in Notion feeds the parser directly.
@@ -141,7 +166,7 @@ TOKEN  = os.environ["NOTION_TOKEN"]
 PARENT = os.environ["PARENT"]
 API    = "https://api.notion.com/v1/"
 
-def call(method, path, payload=None):
+def call(method, path, payload=None, quiet=False):
     req = urllib.request.Request(API + path, method=method)
     req.add_header("Authorization", "Bearer " + TOKEN)
     req.add_header("Notion-Version", "2022-06-28")
@@ -155,7 +180,9 @@ def call(method, path, payload=None):
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503) and attempt < 3:
                 time.sleep(1.2 * (attempt + 1)); continue
-            sys.stderr.write(e.read().decode() + "\n"); raise
+            if not quiet:
+                sys.stderr.write(e.read().decode() + "\n")
+            raise
 
 def rt(): return {"rich_text": {}}
 def sel(*names): return {"select": {"options": [{"name": n} for n in names]}}
@@ -195,7 +222,6 @@ def schema_expenses(people_id):
             # Month/Year formulas PATCHed in afterwards (they reference Date)
             "Expense Type": sel("Food", "Travel", "Shopping", "Utilities",
                                 "Medical", "Entertainment", "Rent", "Groceries", "Other"),
-            "Extra Types": {"multi_select": {"options": []}},
             "Comments": rt(),
             "Payer": rel(people_id),
             "Payment Mode": sel("UPI", "Cash", "Credit Card", "Debit Card", "Unknown"),
@@ -220,10 +246,33 @@ while True:
     if not r.get("has_more"): break
     cursor = r["next_cursor"]
 
-def ensure_db(title, props, icon):
-    """Create the database if absent; otherwise PATCH in any missing properties."""
-    if title in existing:
-        dbid = existing[title]
+# ---- prefer ids from a previous run's state file — survives databases being renamed in
+#      Notion (title matching alone would create a duplicate set after a rename).
+saved = {}
+try:
+    with open(".ironbank_onboarding_state.json") as f:
+        saved = json.load(f)
+except Exception:
+    pass
+
+def db_alive(dbid):
+    if not dbid:
+        return False
+    try:
+        call("GET", f"databases/{dbid}", quiet=True)
+        return True
+    except Exception:
+        return False
+
+def ensure_db(title, props, icon, state_key):
+    """Prefer the state-file id (survives renames), then find by title, else create.
+    Existing databases get any missing properties PATCHed in."""
+    dbid = saved.get(state_key)
+    if dbid and not db_alive(dbid):
+        dbid = None
+    if not dbid:
+        dbid = existing.get(title)
+    if dbid:
         db = call("GET", f"databases/{dbid}")
         missing = {k: v for k, v in props.items()
                    if k not in db["properties"] and "title" not in v}
@@ -241,10 +290,10 @@ def ensure_db(title, props, icon):
     sys.stderr.write(f"  + {title}: created\n")
     return db["id"]
 
-groups_id   = ensure_db("Groups", schema_groups(), "👥")
-swusers_id  = ensure_db("Splitwise Users", schema_swusers(), "📇")
-people_id   = ensure_db("People", schema_people(groups_id, swusers_id), "🧑")
-expenses_id = ensure_db("Expenses", schema_expenses(people_id), "🧾")
+groups_id   = ensure_db("Groups", schema_groups(), "👥", "NOTION_DB_GROUPS")
+swusers_id  = ensure_db("Splitwise Users", schema_swusers(), "📇", "NOTION_DB_SW_USERS")
+people_id   = ensure_db("People", schema_people(groups_id, swusers_id), "🧑", "NOTION_DB_PEOPLE")
+expenses_id = ensure_db("Expenses", schema_expenses(people_id), "🧾", "NOTION_DB_EXPENSES")
 
 # ---- post-create PATCHes: self-relation + formulas (both idempotent)
 pdb = call("GET", f"databases/{people_id}")
@@ -288,6 +337,14 @@ cat <<'EOS'
   The loader fetches the IronBank brain from GitHub on every request, so the
   backend self-updates — you will never paste code again after today.
 EOS
+# Save the user a copy-paste: put the loader on the clipboard when a tool exists.
+if command -v pbcopy >/dev/null 2>&1; then
+  pbcopy < google_apps_script_loader.js && ok "google_apps_script_loader.js is on your clipboard — just paste it"
+elif command -v clip.exe >/dev/null 2>&1; then
+  clip.exe < google_apps_script_loader.js && ok "google_apps_script_loader.js is on your clipboard — just paste it"
+elif command -v xclip >/dev/null 2>&1; then
+  xclip -selection clipboard < google_apps_script_loader.js && ok "google_apps_script_loader.js is on your clipboard — just paste it"
+fi
 pause
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -332,7 +389,9 @@ read -r -p "  Paste the Web App URL: " WEBAPP_URL
 case "$WEBAPP_URL" in https://script.google.com/*) ;; *) die "That doesn't look like an Apps Script Web App URL." ;; esac
 
 # Verify the deployment is live and the bot token secret landed (ping is auth'd).
-PING=$(curl -sL -X POST "$WEBAPP_URL" \
+# NOTE: no -X POST — --data already makes this a POST, and Apps Script answers POSTs with a
+# 302 whose echo URL must be fetched with GET (forcing POST on the redirect breaks it).
+PING=$(curl -sL "$WEBAPP_URL" \
   --data-urlencode "action=ping" \
   --data-urlencode "secret=${TELEGRAM_BOT_TOKEN}")
 case "$PING" in
@@ -343,9 +402,9 @@ esac
 
 # Push each NON-SECRET key into Script Properties via the Web App's updateConfig
 # action (auth: secret = bot token; -L follows Apps Script's 302 redirect).
-push_cfg() { # push_cfg KEY VALUE
+push_cfg() { # push_cfg KEY VALUE  (no -X POST — see the ping note above)
   local out
-  out=$(curl -sL -X POST "$WEBAPP_URL" \
+  out=$(curl -sL "$WEBAPP_URL" \
         --data-urlencode "action=updateConfig" \
         --data-urlencode "secret=${TELEGRAM_BOT_TOKEN}" \
         --data-urlencode "key=$1" \
@@ -362,8 +421,50 @@ push_cfg "NOTION_DB_GROUPS"      "$DB_GROUPS"
 push_cfg "NOTION_DB_SW_USERS"    "$DB_SWUSERS"
 push_cfg "NOTION_PARENT_PAGE_ID" "$NOTION_PARENT_PAGE_ID"
 push_cfg "SCHEMA_VERSION"        "$SCHEMA_VERSION"
-[ -n "${TELEGRAM_CHAT_ID:-}" ] && push_cfg "TELEGRAM_CHAT_ID" "$TELEGRAM_CHAT_ID"
+push_cfg "TELEGRAM_CHAT_ID"      "$TELEGRAM_CHAT_ID"
 push_cfg "WEBAPP_URL"            "$WEBAPP_URL"   # last: this key also triggers setupWebhook()
+
+# Live-verify every secret you pasted in step 4 through the deployed app. The check runs
+# inside Apps Script (pass/fail per key only — values never leave Script Properties).
+DIAG=$(curl -sL "$WEBAPP_URL" \
+  --data-urlencode "action=diagnose" \
+  --data-urlencode "secret=${TELEGRAM_BOT_TOKEN}")
+"$PY" - "$DIAG" <<'PYEOF' || die "Fix the failing value(s) in Script Properties (step 4), then re-run this script — every step is idempotent."
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    print("  ! diagnose returned an unexpected response: " + sys.argv[1][:200]); sys.exit(1)
+checks = d.get("checks", {})
+labels = [("telegram", "TELEGRAM_BOT_TOKEN"), ("gemini", "GEMINI_API_KEY"),
+          ("splitwise", "SPLITWISE_TOKEN"), ("notion", "NOTION_TOKEN (+ database ids)")]
+bad = False
+for key, label in labels:
+    good = bool(checks.get(key))
+    print(("  \033[32m✓\033[0m " if good else "  \033[31m✗\033[0m ") + label + ("" if good else "   <-- failing"))
+    bad = bad or not good
+sys.exit(1 if bad else 0)
+PYEOF
+
+# Install the 15-min sync trigger through the Web App (it executes as you — the script's
+# own authorized context — so no editor visit is needed).
+TRG=$(curl -sL "$WEBAPP_URL" \
+  --data-urlencode "action=installTrigger" \
+  --data-urlencode "secret=${TELEGRAM_BOT_TOKEN}")
+case "$TRG" in
+  *'"success":true'*) ok "Sync trigger installed (pollSplitwise, time-driven)" ;;
+  *) warn "Couldn't install the trigger automatically — fallback: run installPollTrigger once in the Apps Script editor. Response: $TRG" ;;
+esac
+
+# Run the first sync now, so Groups + contacts are already in Notion when you open it.
+echo "  Running the first Splitwise ↔ Notion sync (can take a minute)..."
+SYNC=$(curl -sL --max-time 360 "$WEBAPP_URL" \
+  --data-urlencode "action=sync" \
+  --data-urlencode "secret=${TELEGRAM_BOT_TOKEN}")
+case "$SYNC" in
+  *'"ok":true'*) ok "First sync complete — your Splitwise groups and contacts are in Notion" ;;
+  *) warn "First sync didn't finish cleanly (the trigger will retry it): ${SYNC:0:160}" ;;
+esac
 
 # Verify the webhook actually landed on Telegram's side.
 WH=$(curl -sf "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo")
@@ -373,30 +474,25 @@ case "$WH" in
 esac
 
 # ─────────────────────────────────────────────────────────────────────────────
-bold "STEP 6/6 — Sync trigger + first contact + views (manual, last mile)"
+bold "STEP 6/6 — First contact + build the views (last mile)"
 # ─────────────────────────────────────────────────────────────────────────────
 cat <<EOS
-  1. TRIGGER (manual — triggers must be created from inside Apps Script):
-     In the editor, select the function  installPollTrigger  and click ▶ Run.
-     Verify under the Triggers (⏰) page: pollSplitwise, time-driven, every
-     15 minutes. This is the Splitwise ↔ Notion sync.
+  1. FIRST CONTACT: message your bot  @${BOT_USER}  right now — e.g. "/help".
+     Only your pinned chat id (${TELEGRAM_CHAT_ID}) can talk to it.
 
-  2. FIRST CONTACT: message your bot  @${BOT_USER}  right now — e.g. "/help".
-$( [ -z "${TELEGRAM_CHAT_ID:-}" ] && echo '     ⚠ You skipped chat-id pinning, so the FIRST chat to message the bot becomes'
-   [ -z "${TELEGRAM_CHAT_ID:-}" ] && echo '       the owner. Do this immediately.' )
+  2. GROUPS: your Splitwise groups are already in the Notion "Groups"
+     database (the first sync just ran). Tick  Allowed  on the ones to
+     import — each gets a one-time history backfill, then stays current.
 
-  3. GROUPS: after the first sync (≤15 min, or send /sync to the bot) your
-     Splitwise groups appear in the Notion "Groups" database. Tick  Allowed
-     on the ones to import — each gets a one-time history backfill, then
-     stays current.
-
-  4. PEOPLE: as names appear in "People", set each person's Splitwise
+  3. PEOPLE: as names appear in "People", set each person's Splitwise
      Identity (a dropdown fed by the Splitwise Users contacts DB — check the
      Candidates column for suggested matches). Default Group is optional:
      leave it empty to settle with them as direct friend expenses.
 
-  5. VIEWS (manual — the Notion API cannot create views): build the dashboard
-     once by following DASHBOARD.md in this repository.
+  4. VIEWS (manual — the Notion API cannot create views): build the dashboard
+     once. Open  dashboard_build_guide.html  from this repository in your
+     browser — it tracks your progress as you build (DASHBOARD.md is the
+     plain-text version of the same guide).
 
   Smoke test: send  "100 chai me and <a friend>"  to @${BOT_USER} — you should
   get a parsed split reply, a row in Notion Expenses, and (once that friend

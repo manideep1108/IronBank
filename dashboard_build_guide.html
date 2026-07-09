@@ -1,3 +1,4 @@
+<meta charset="utf-8">
 <title>IronBank — Dashboard Build Guide</title>
 <style>
   :root {
@@ -144,6 +145,45 @@
   .foot code { font-size: 0.8em; }
   a { color: var(--accent-ink); }
   a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+  /* On this page */
+  .toc { background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+    padding: 0.9rem 1.1rem 1rem; box-shadow: var(--shadow); margin-bottom: 0.9rem; }
+  .toc-label { font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--ink-faint); margin: 0 0 0.55rem; }
+  .toc ol { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.4rem; }
+  .toc li { max-width: none; }
+  .toc a { display: inline-flex; align-items: baseline; gap: 0.45em; font-size: 0.85rem; text-decoration: none;
+    color: var(--ink); background: var(--surface-2); border: 1px solid var(--line); border-radius: 999px;
+    padding: 0.22em 0.75em; }
+  .toc a:hover { border-color: var(--accent); color: var(--accent-ink); }
+  .toc a .n { font-family: var(--mono); font-size: 0.72em; color: var(--accent); }
+  .progress { display: flex; align-items: center; gap: 0.8rem; margin-top: 0.9rem; padding-top: 0.85rem;
+    border-top: 1px dashed var(--line-strong); }
+  .progress .bar { flex: 1; height: 6px; border-radius: 999px; background: var(--surface-2);
+    border: 1px solid var(--line); overflow: hidden; }
+  .progress .bar i { display: block; height: 100%; width: 0; background: var(--good); border-radius: inherit;
+    transition: width 0.25s ease; }
+  .progress .count { font-family: var(--mono); font-size: 0.74rem; color: var(--ink-soft); white-space: nowrap; }
+  .toc .hint { margin: 0.45rem 0 0; font-size: 0.78rem; color: var(--ink-faint); }
+
+  /* "Built" checkbox on recipe cards */
+  .hdr-right { display: inline-flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; }
+  .built { display: inline-flex; align-items: center; gap: 0.35em; font-family: var(--mono); font-size: 0.72rem;
+    text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-faint); cursor: pointer;
+    user-select: none; -webkit-user-select: none; }
+  .built input { accent-color: var(--good); width: 0.95rem; height: 0.95rem; cursor: pointer; margin: 0; }
+  .recipe:has(.built input:checked) { border-color: color-mix(in srgb, var(--good) 45%, var(--line)); }
+  .recipe:has(.built input:checked) h4::after { content: " ✓"; color: var(--good); }
+
+  /* Copy button */
+  .copybtn { font-family: var(--mono); font-size: 0.72rem; margin-top: 0.45rem; padding: 0.28em 0.8em;
+    border-radius: 6px; border: 1px solid var(--line-strong); background: var(--surface-2); color: var(--ink-soft);
+    cursor: pointer; }
+  .copybtn:hover { border-color: var(--accent); color: var(--accent-ink); }
+  .copybtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   @media (max-width: 480px) {
     .spec { grid-template-columns: 1fr; gap: 0.1rem 0; }
     .spec dt { padding-top: 0.5rem; }
@@ -163,25 +203,45 @@
     </div>
   </header>
 
+  <nav class="toc" aria-label="On this page">
+    <p class="toc-label">On this page</p>
+    <ol>
+      <li><a href="#s01"><span class="n">01</span>How it fits together</a></li>
+      <li><a href="#s02"><span class="n">02</span>Notion mechanics</a></li>
+      <li><a href="#s03"><span class="n">03</span>The four databases</a></li>
+      <li><a href="#s04"><span class="n">04</span>Needs your attention</a></li>
+      <li><a href="#s05"><span class="n">05</span>Balances</a></li>
+      <li><a href="#s06"><span class="n">06</span>Expenditure</a></li>
+      <li><a href="#s07"><span class="n">07</span>Splitwise manager</a></li>
+      <li><a href="#s08"><span class="n">08</span>How to resolve things</a></li>
+      <li><a href="#s09"><span class="n">09</span>Status reference</a></li>
+    </ol>
+    <div class="progress">
+      <span class="bar" aria-hidden="true"><i></i></span>
+      <span class="count">0 of 12 views built</span>
+    </div>
+    <p class="hint">Tick <strong>Built</strong> on a view card as you finish it — progress is saved in this browser.</p>
+  </nav>
+
   <div class="note warn">
-    <span class="ic">📊</span>
-    <p><strong>No chart views in this build.</strong> Every "breakdown" below is a <strong>grouped table</strong> or <strong>board</strong> with a <strong>column Sum</strong> turned on — Notion totals each group for you, so you get spend-by-category and monthly totals without a single chart. Wherever you'd expect a pie or bar, group a table instead.</p>
+    <span class="ic" aria-hidden="true">📊</span>
+    <p><strong>No chart views in this build.</strong> Every "breakdown" below is a <strong>grouped table</strong> or <strong>board</strong> with a <strong>column Sum</strong> turned on — Notion totals each group for you, so you get spend-by-category and monthly totals without a single chart. Wherever you'd expect a pie or bar, group a table instead. <em>(On paid Notion plans you can additionally add a native chart view on the same data — these recipes work on every plan, free included.)</em></p>
   </div>
   <div class="note info">
-    <span class="ic">⏱️</span>
+    <span class="ic" aria-hidden="true">⏱️</span>
     <p><strong>Data is up to ~15 minutes old</strong> — that's the sync interval. <code>Groups → Last Synced</code> shows the last run; send <code>/sync</code> to the bot to refresh right now, or <code>/status</code> to see sync health and what's waiting on you.</p>
   </div>
 
-  <section class="flow">
+  <section class="flow" id="s01">
     <h2><span class="n">01</span> How it fits together</h2>
     <p class="section-lede">You almost never touch Notion to <em>enter</em> data — you build the views and then read them.</p>
     <p>You message the Telegram bot ("<em>800 dinner, me and Aditya</em>"). Apps Script parses it, resolves each name to a person, works out the split, records it in the <strong>Expenses</strong> database, and — when it can — pushes it to Splitwise. A background sync runs every ~15 minutes: it pulls your Splitwise activity (group <em>and</em> direct friend expenses) back into Notion, refreshes everyone's balances, and carries out anything you've flagged (settle a parked expense, merge a name, delete a row).</p>
     <p>Notion's API can create databases and properties but <strong>not</strong> views — so the databases below already exist and stay in sync, and the view layer is the one thing you build by hand. Do it once; it keeps working.</p>
   </section>
 
-  <section>
+  <section id="s02">
     <h2><span class="n">02</span> Notion mechanics, in 60 seconds</h2>
-    <p class="section-lede">Everything below is a <em>linked view</em> plus a filter. If you've built one before, skip ahead.</p>
+    <p class="section-lede">Everything below is a <em>linked view</em> plus a filter. If you've built one before, <a href="#s04">skip ahead</a>.</p>
     <ol class="steps">
       <li>On your dashboard page type <code>/linked</code> and choose <strong>Linked view of database</strong>, then pick the source database (e.g. <em>Expenses</em>).</li>
       <li>Open the view's <strong>⋯ menu → Filter / Sort / Group</strong> and apply the recipe's spec.</li>
@@ -190,7 +250,7 @@
     </ol>
   </section>
 
-  <section>
+  <section id="s03">
     <h2><span class="n">03</span> The four databases</h2>
     <p class="section-lede">What each one holds and the fields the views lean on.</p>
     <div class="db-grid">
@@ -225,22 +285,22 @@
     </div>
   </section>
 
-  <section>
+  <section id="s04">
     <h2><span class="n">04</span> ⚠️ Needs Your Attention</h2>
     <p class="section-lede">Put this block at the very top of the home page — it's your to-do list. Three linked views.</p>
     <div class="recipes">
       <article class="recipe">
-        <header><h4>Expenses to map</h4><span class="chip table">Table</span></header>
+        <header><h4>Expenses to map</h4><span class="hdr-right"><span class="chip table">Table</span><label class="built"><input type="checkbox" data-view="attn-expenses-to-map"> Built</label></span></header>
         <dl class="spec">
           <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
           <div style="display:contents"><dt>Filter</dt><dd><code>Settlement Status</code> is <span class="chip mapping">Needs mapping</span></dd></div>
           <div style="display:contents"><dt>Sort</dt><dd><code>Date</code> — descending</dd></div>
           <div style="display:contents"><dt>Show</dt><dd>Description · Splits Summary · Total Amount · Participants</dd></div>
         </dl>
-        <p class="why"><b>Why:</b> these expenses are recorded but couldn't be pushed to Splitwise — usually a participant isn't set up yet. Fixing the person (section 07) clears them automatically on the next sync.</p>
+        <p class="why"><b>Why:</b> these expenses are recorded but couldn't be pushed to Splitwise — usually a participant isn't set up yet. Fixing the person (<a href="#s08">section 08</a>) clears them automatically on the next sync.</p>
       </article>
       <article class="recipe">
-        <header><h4>People to set up</h4><span class="chip table">Table</span></header>
+        <header><h4>People to set up</h4><span class="hdr-right"><span class="chip table">Table</span><label class="built"><input type="checkbox" data-view="attn-people-to-set-up"> Built</label></span></header>
         <dl class="spec">
           <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>People</dd></div>
           <div style="display:contents"><dt>Filter</dt><dd><code>Splitwise User ID</code> is empty</dd></div>
@@ -249,7 +309,7 @@
         <p class="why"><b>Why:</b> a person can't settle until they have a Splitwise identity. The <code>Candidates</code> column carries auto-suggested matches from your contacts — usually the right person is already listed, so it's a glance-and-pick in the <code>Splitwise Identity</code> dropdown, not an 80-contact hunt.</p>
       </article>
       <article class="recipe">
-        <header><h4>Pending sync actions</h4><span class="chip table">Table</span></header>
+        <header><h4>Pending sync actions</h4><span class="hdr-right"><span class="chip table">Table</span><label class="built"><input type="checkbox" data-view="attn-pending-sync"> Built</label></span></header>
         <dl class="spec">
           <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
           <div style="display:contents"><dt>Filter</dt><dd><code>Sync Action</code> is not empty <em>and</em> is not <code>None</code></dd></div>
@@ -260,25 +320,25 @@
     </div>
   </section>
 
-  <section>
+  <section id="s05">
     <h2><span class="n">05</span> 💰 Balances at a Glance</h2>
     <p class="section-lede">Who owes whom — the numbers come straight from Splitwise, refreshed every sync.</p>
     <div class="recipes">
       <article class="recipe">
-        <header><h4>Balances</h4><span class="chip table">Table</span></header>
+        <header><h4>Balances</h4><span class="hdr-right"><span class="chip table">Table</span><label class="built"><input type="checkbox" data-view="bal-balances"> Built</label></span></header>
         <dl class="spec">
           <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>People</dd></div>
           <div style="display:contents"><dt>Filter</dt><dd><code>Net Balance</code> is not <code>0</code> (hide settled people)</dd></div>
           <div style="display:contents"><dt>Sort</dt><dd><code>Net Balance</code> — descending</dd></div>
-          <div style="display:contents"><dt>Show</dt><dd>Name · Net Balance · Net Balance By Group</dd></div>
+          <div style="display:contents"><dt>Show</dt><dd>Name · Net Balance · Net Balance By Group · Net Balance Updated</dd></div>
           <div style="display:contents"><dt>Calc</dt><dd>On <code>Net Balance</code>, set the column calculation to <strong>Sum</strong></dd></div>
         </dl>
-        <p class="why"><b>Why:</b> positive means they owe you, negative means you owe them. The column Sum at the bottom is your overall net position. <code>Net Balance By Group</code> breaks it down by group <em>name</em> for when you actually settle — settle in the Splitwise app; the payment flows back here on the next sync.</p>
+        <p class="why"><b>Why:</b> positive means they owe you, negative means you owe them. The column Sum at the bottom is your overall net position. <code>Net Balance By Group</code> breaks it down by group <em>name</em> for when you actually settle — settle in the Splitwise app; the payment flows back here on the next sync. <code>Net Balance Updated</code> is the freshness stamp — an old date means that number stopped syncing, so don't trust it blindly.</p>
       </article>
       <article class="recipe">
-        <header><h4>Owes you / You owe <span style="color:var(--ink-faint);font-weight:400">(optional)</span></h4><span class="chip board">Board</span></header>
+        <header><h4>Owes you / You owe <span style="color:var(--ink-faint);font-weight:400">(optional)</span></h4><span class="hdr-right"><span class="chip board">Board</span><label class="built"><input type="checkbox" data-view="bal-direction-board"> Built</label></span></header>
         <dl class="spec">
-          <div style="display:contents"><dt>Prep</dt><dd>Add a formula property <code>Direction</code> to People:<code class="block">if(prop("Net Balance") &gt; 0, "Owes you", if(prop("Net Balance") &lt; 0, "You owe", "Settled"))</code></dd></div>
+          <div style="display:contents"><dt>Prep</dt><dd>Add a formula property <code>Direction</code> to People:<code class="block">if(prop("Net Balance") &gt; 0, "Owes you", if(prop("Net Balance") &lt; 0, "You owe", "Settled"))</code><button class="copybtn" type="button">Copy formula</button></dd></div>
           <div style="display:contents"><dt>Group by</dt><dd><code>Direction</code></dd></div>
           <div style="display:contents"><dt>Calc</dt><dd>Sum of <code>Net Balance</code> per column</dd></div>
         </dl>
@@ -286,17 +346,17 @@
       </article>
     </div>
     <div class="note" style="margin-top:0.9rem">
-      <span class="ic">🤝</span>
+      <span class="ic" aria-hidden="true">🤝</span>
       <p><strong>Where are the settle-up payments?</strong> Recorded payments deliberately don't appear as Expense rows — they only move <code>Net Balance</code>. If someone paid you back, look here, not in the ledger.</p>
     </div>
   </section>
 
-  <section>
+  <section id="s06">
     <h2><span class="n">06</span> 📊 Expenditure</h2>
     <p class="section-lede">Your spend, broken down — all as grouped tables with a <strong>Sum on Amount</strong>. <code>Amount</code> is <em>your</em> share (what you actually spent); <code>Total Amount</code> is the full bill. Totals below use <code>Amount</code>.</p>
     <div class="recipes">
       <article class="recipe">
-        <header><h4>This Month</h4><span class="chip table">Table</span></header>
+        <header><h4>This Month</h4><span class="hdr-right"><span class="chip table">Table</span><label class="built"><input type="checkbox" data-view="exp-this-month"> Built</label></span></header>
         <dl class="spec">
           <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
           <div style="display:contents"><dt>Filter</dt><dd><code>Date</code> is within — This month</dd></div>
@@ -306,7 +366,7 @@
         <p class="why"><b>Why:</b> your running spend this month, newest first, totalled at the foot. (Same numbers as <code>/report</code> in Telegram.)</p>
       </article>
       <article class="recipe">
-        <header><h4>By Category</h4><span class="chip board">Board</span> <span class="chip table">or Table</span></header>
+        <header><h4>By Category</h4><span class="hdr-right"><span class="chip board">Board</span> <span class="chip table">or Table</span><label class="built"><input type="checkbox" data-view="exp-by-category"> Built</label></span></header>
         <dl class="spec">
           <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
           <div style="display:contents"><dt>Group by</dt><dd><code>Expense Type</code></dd></div>
@@ -315,17 +375,17 @@
         <p class="why"><b>Why:</b> this is the pie chart, without the pie — each category carries its own total. As a Board it's visual; as a grouped Table it's compact.</p>
       </article>
       <article class="recipe">
-        <header><h4>By Month</h4><span class="chip table">Table</span></header>
+        <header><h4>By Month</h4><span class="hdr-right"><span class="chip table">Table</span><label class="built"><input type="checkbox" data-view="exp-by-month"> Built</label></span></header>
         <dl class="spec">
           <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
           <div style="display:contents"><dt>Group by</dt><dd><code>Month</code> (a formula field, format <code>YYYY-MM</code>, so years don't merge)</dd></div>
           <div style="display:contents"><dt>Sort</dt><dd>group by <code>Month</code> descending</dd></div>
           <div style="display:contents"><dt>Calc</dt><dd>Sum on <code>Amount</code> per month</dd></div>
         </dl>
-        <p class="why"><b>Why:</b> month-over-month spend as a stack of totals. <code>Month</code> and <code>Year</code> are computed from <code>Date</code> automatically — nothing to fill in.</p>
+        <p class="why"><b>Why:</b> month-over-month spend as a stack of totals. <code>Month</code> and <code>Year</code> are computed from <code>Date</code> automatically — nothing to fill in. Group by <code>Year</code> instead for an annual roll-up.</p>
       </article>
       <article class="recipe">
-        <header><h4>By Person</h4><span class="chip table">Table</span></header>
+        <header><h4>By Person</h4><span class="hdr-right"><span class="chip table">Table</span><label class="built"><input type="checkbox" data-view="exp-by-person"> Built</label></span></header>
         <dl class="spec">
           <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
           <div style="display:contents"><dt>Filter</dt><dd><code>Participants</code> contains — <em>the person</em></dd></div>
@@ -335,7 +395,7 @@
         <p class="why"><b>Why:</b> your entire shared history with one person — this is exactly what the <code>Participants</code> relation exists for. Duplicate the view per person you split with often.</p>
       </article>
       <article class="recipe">
-        <header><h4>All Expenses</h4><span class="chip table">Table</span></header>
+        <header><h4>All Expenses</h4><span class="hdr-right"><span class="chip table">Table</span><label class="built"><input type="checkbox" data-view="exp-all"> Built</label></span></header>
         <dl class="spec">
           <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
           <div style="display:contents"><dt>Filter</dt><dd>none</dd></div>
@@ -346,12 +406,12 @@
     </div>
   </section>
 
-  <section>
+  <section id="s07">
     <h2><span class="n">07</span> 🔧 Splitwise Manager</h2>
     <p class="section-lede">The controls: which groups to import, and your contact list.</p>
     <div class="recipes">
       <article class="recipe">
-        <header><h4>Groups</h4><span class="chip table">Table</span></header>
+        <header><h4>Groups</h4><span class="hdr-right"><span class="chip table">Table</span><label class="built"><input type="checkbox" data-view="mgr-groups"> Built</label></span></header>
         <dl class="spec">
           <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Groups</dd></div>
           <div style="display:contents"><dt>Show</dt><dd>Name · <code>Allowed</code> · <code>Backfilled</code> · Last Synced</dd></div>
@@ -360,7 +420,7 @@
         <p class="why"><b>Why:</b> tick <code>Allowed</code> to onboard a group — the next sync pulls its full history once (<code>Backfilled</code> flips to done), then keeps it current. Untick to stop importing. Non-INR groups never appear — that's by design.</p>
       </article>
       <article class="recipe">
-        <header><h4>Contacts</h4><span class="chip table">Table</span></header>
+        <header><h4>Contacts</h4><span class="hdr-right"><span class="chip table">Table</span><label class="built"><input type="checkbox" data-view="mgr-contacts"> Built</label></span></header>
         <dl class="spec">
           <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Splitwise Users</dd></div>
           <div style="display:contents"><dt>Show</dt><dd>Name · Email · In Groups</dd></div>
@@ -371,7 +431,7 @@
     </div>
   </section>
 
-  <section>
+  <section id="s08">
     <h2><span class="n">08</span> 🧩 How to resolve things</h2>
     <p class="section-lede">The handful of actions you'll actually take — all done by editing a row, no IDs to type.</p>
 
@@ -416,7 +476,7 @@
     </div>
   </section>
 
-  <section>
+  <section id="s09">
     <h2><span class="n">09</span> Settlement status reference</h2>
     <p class="section-lede">The <code>Settlement Status</code> on each expense tells you where it stands.</p>
     <div class="table-scroll">
@@ -431,7 +491,7 @@
           <tr>
             <td><span class="chip mapping">Needs mapping</span></td>
             <td>Recorded, but a participant isn't set up yet, so it couldn't be pushed.</td>
-            <td>Yes — set up the person (section 08). It clears automatically.</td>
+            <td>Yes — set up the person (<a href="#s08">section 08</a>). It clears automatically.</td>
           </tr>
           <tr>
             <td><span class="chip notion">Notion-only</span></td>
@@ -448,3 +508,51 @@
   </footer>
 
 </div>
+
+<script>
+(function () {
+  var KEY = 'ironbank-guide-built';
+  var saved = {};
+  try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) {}
+  var boxes = Array.prototype.slice.call(document.querySelectorAll('.built input'));
+  var bar = document.querySelector('.progress .bar i');
+  var count = document.querySelector('.progress .count');
+  function refresh() {
+    var done = boxes.filter(function (b) { return b.checked; }).length;
+    if (bar) bar.style.width = (boxes.length ? 100 * done / boxes.length : 0) + '%';
+    if (count) count.textContent = done + ' of ' + boxes.length + ' views built';
+  }
+  boxes.forEach(function (b) {
+    b.checked = !!saved[b.dataset.view];
+    b.addEventListener('change', function () {
+      saved[b.dataset.view] = b.checked;
+      try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch (e) {}
+      refresh();
+    });
+  });
+  refresh();
+  document.querySelectorAll('.copybtn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var code = btn.previousElementSibling.textContent;
+      function flash(msg) {
+        btn.textContent = msg;
+        setTimeout(function () { btn.textContent = 'Copy formula'; }, 1600);
+      }
+      function legacyCopy() {
+        var ta = document.createElement('textarea');
+        ta.value = code;
+        ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        var ok = false;
+        try { ok = document.execCommand('copy'); } catch (e) {}
+        document.body.removeChild(ta);
+        flash(ok ? 'Copied ✓' : 'Copy failed — select it manually');
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(code).then(function () { flash('Copied ✓'); }, legacyCopy);
+      } else { legacyCopy(); }
+    });
+  });
+})();
+</script>

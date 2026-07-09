@@ -1,0 +1,3 @@
+# onboarding.sh must keep LF endings — a CRLF checkout (Git for Windows' autocrlf default)
+# breaks bash with "\r: command not found" errors.
+*.sh text eol=lf
