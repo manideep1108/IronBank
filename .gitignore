@@ -1,0 +1,12 @@
+# onboarding state (contains Notion database ids — no secrets, but it's per-instance)
+.ironbank_onboarding_state.json
+
+# never commit credentials of any shape
+config*.json
+*.env
+.env*
+*secret*
+
+# local scratch
+*.log
+__pycache__/
