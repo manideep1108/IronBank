@@ -27,7 +27,7 @@ SETTLE     Splitwise — native settlement + authoritative balances
 - **Receipt scanning** — send a photo (with an optional caption for split instructions); Gemini reads the merchant, date, and total.
 - **Smart name resolution** — nicknames and typos resolve against your Notion People roster; genuinely ambiguous names ("Adi" → Aditya or Aditi?) get inline Telegram buttons; confirmed nicknames are learned as aliases and never asked again.
 - **Automatic Splitwise settlement** — each participant is routed to their default Splitwise group, or settled as a direct friend expense if they have none. One expense can span several groups; you always see exactly who owes what in the bot's reply.
-- **Everything lands in Notion** — one row per expense with your share, the full bill, category, payment mode, participants, and settlement status. Your Splitwise activity (including expenses *others* paid) flows in automatically.
+- **Everything lands in Notion** — one row per expense with your share, the full bill, category, payment mode, participants, and settlement status. Your Splitwise activity (including expenses *others* paid) flows in automatically and is auto-categorized by Gemini against your Notion category list.
 - **Live balances** — every sync refreshes each person's net balance from Splitwise. `/settle` in Telegram or the Balances view in Notion answers "who owes whom" at any moment.
 - **Bot commands** — `/report` (monthly spend by category), `/settle` (balances), `/sync` (run the sync now), `/status` (sync health + what needs attention), `/help`.
 
