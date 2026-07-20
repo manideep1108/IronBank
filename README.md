@@ -45,10 +45,12 @@ Don't want to use the template? Share any blank page instead — the script will
 ```bash
 git clone https://github.com/manideep1108/IronBank.git
 cd IronBank
-./onboarding.sh
+python onboarding.py
 ```
 
-**No git?** Use the green **Code → Download ZIP** button on GitHub instead, extract it, and run the same script from inside the extracted folder. One difference: GitHub's ZIP export doesn't preserve the executable bit, so `./onboarding.sh` may say "Permission denied" — run `bash onboarding.sh` instead (or on Windows, see below). Everything else is identical.
+Onboarding is a single Python script — **the same command on Windows, macOS, and Linux**. The only requirement is **Python 3.7+** (already on most Macs/Linux; on Windows install it from [python.org](https://www.python.org/downloads/windows/) and tick **"Add python.exe to PATH"**). No bash, curl, or Git Bash needed — it uses only Python's standard library. On some systems Python is `python3` rather than `python` (`python3 onboarding.py`); on Unix-likes `./onboarding.sh` still works as a thin shim that just calls it.
+
+**No git?** Use the green **Code → Download ZIP** button on GitHub instead, extract it, and run `python onboarding.py` from inside the extracted folder. Everything else is identical — and because it's launched via `python`, there's no executable-bit issue like shell scripts have from ZIP downloads.
 
 The script walks you through everything and automates what can be automated:
 
@@ -69,25 +71,18 @@ The script walks you through everything and automates what can be automated:
 
 ### Running on Windows
 
-`onboarding.sh` is a bash script and needs **Git Bash** underneath either way — there's no separate implementation to keep in sync, just two ways to launch the same script. One-time setup:
+Onboarding runs natively in a plain **Command Prompt** or **PowerShell** window — no Git Bash, no WSL, no wrapper:
 
-1. Install [Git for Windows](https://gitforwindows.org) (bundles **Git Bash** and `curl`).
-2. Install [Python 3](https://www.python.org/downloads/windows/) and tick **"Add python.exe to PATH"** in the installer.
-3. Either:
-   - **From a plain `cmd.exe` window** (double-clicking `onboarding.sh` itself won't work — Windows doesn't know what a `.sh` file is): run `onboarding.bat` instead. It's a thin wrapper that finds Git Bash and runs `onboarding.sh` through it — same script, same prompts, just launchable from cmd.
-     ```bat
-     git clone https://github.com/manideep1108/IronBank.git
-     cd IronBank
-     onboarding.bat
-     ```
-   - **From Git Bash** (Start menu), run the same three commands as the top of this section:
-     ```bash
-     git clone https://github.com/manideep1108/IronBank.git
-     cd IronBank
-     ./onboarding.sh
-     ```
+1. Install [Python 3](https://www.python.org/downloads/windows/) and tick **"Add python.exe to PATH"** in the installer.
+2. In `cmd` or PowerShell:
+   ```bat
+   git clone https://github.com/manideep1108/IronBank.git
+   cd IronBank
+   python onboarding.py
+   ```
+   No git? [Download the ZIP](https://github.com/manideep1108/IronBank), extract it, `cd` into the folder, and run `python onboarding.py`.
 
-Notes: paste into Git Bash with right-click or `Shift+Insert`; the script copies the Apps Script loader to your clipboard automatically (via `clip.exe`); line endings are pinned to LF by `.gitattributes`, so the default `autocrlf` clone setting can't break the script. `onboarding.bat` isn't affected by the ZIP-download executable-bit issue mentioned above — it invokes bash directly on the script file regardless of permissions. Prefer **WSL**? That works identically to Git Bash — `sudo apt install curl python3` if they're missing, then the same three commands.
+Notes: the script copies the Apps Script loader to your clipboard automatically (via `clip`); secret prompts are hidden as you type — paste with right-click or `Ctrl+V` and press Enter (nothing shows on screen, that's expected). Output is forced to UTF-8, so status marks render correctly regardless of your console's codepage.
 
 ## Daily use
 
@@ -109,7 +104,7 @@ Notes: paste into Git Bash with right-click or `Shift+Insert`; the script copies
 
 ## Configuration reference
 
-Everything lives in Apps Script **Script Properties** (⚙ Project Settings). `onboarding.sh` sets the non-secrets for you.
+Everything lives in Apps Script **Script Properties** (⚙ Project Settings). `onboarding.py` sets the non-secrets for you.
 
 | Key | Secret? | Purpose |
 |---|---|---|

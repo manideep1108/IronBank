@@ -150,7 +150,7 @@ function doPost(e) {
   return runRemote("doPost", [e]);
 }
 
-// Run ONCE from the editor after deploying the Web App (or let onboarding.sh
+// Run ONCE from the editor after deploying the Web App (or let onboarding.py
 // trigger it by setting WEBAPP_URL): registers the Telegram webhook.
 function setupWebhook() {
   return runRemote("setupWebhook", []);
@@ -163,7 +163,7 @@ function pollSplitwise() {
   return runRemote("pollSplitwise", []);
 }
 
-// Installs the sync trigger (onboarding.sh normally does this for you through the Web App's
+// Installs the sync trigger (onboarding.py normally does this for you through the Web App's
 // installTrigger action — run this manually only as a fallback). Cadence comes from the
 // POLL_INTERVAL_MIN Script Property (1/5/10/15/30; default 15).
 // Idempotent: clears any existing pollSplitwise triggers first so re-running won't stack them.

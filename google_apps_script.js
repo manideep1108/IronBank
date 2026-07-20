@@ -11,7 +11,7 @@
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
 var IRONBANK_VERSION = "1.2.0";
-var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.sh)
+var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
 // CONFIGURATION AND GLOBALS
@@ -357,7 +357,7 @@ function doPost(e) {
       return HtmlService.createHtmlOutput("OK");
     }
 
-    // --- Config API (used by onboarding.sh; auth: secret = bot token) ---
+    // --- Config API (used by onboarding.py; auth: secret = bot token) ---
     // Surface is deliberately tiny: ping (verify a live deploy), updateConfig (write one
     // Script Property), diagnose (live-check each stored secret — pass/fail only, no values),
     // installTrigger (install the sync trigger), sync (run pollSplitwise now).
@@ -1019,7 +1019,7 @@ function processReceiptPhoto(photoArray, caption, geminiKey, token, chatId, mess
 
 // ==========================================
 // NOTION INTEGRATION — Notion is the system of record.
-// NOTION_TOKEN + NOTION_DB_* ids come from Script Properties (see onboarding.sh).
+// NOTION_TOKEN + NOTION_DB_* ids come from Script Properties (see onboarding.py).
 // If unset, Notion writes are skipped and the bot degrades to parse-and-reply only.
 // ==========================================
 var NOTION_API_VERSION = "2022-06-28";

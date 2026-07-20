@@ -1,3 +1,5 @@
-# onboarding.sh must keep LF endings — a CRLF checkout (Git for Windows' autocrlf default)
-# breaks bash with "\r: command not found" errors.
+# Shell scripts must keep LF endings — a CRLF checkout (Git for Windows' autocrlf
+# default) breaks bash with "\r: command not found" errors. Python is happy with
+# either, but LF keeps the onboarding script consistent across platforms.
 *.sh text eol=lf
+*.py text eol=lf
