@@ -1485,6 +1485,9 @@ var POLL_BACKFILL_BATCH = 150;  // max expenses backfilled per group per run (yi
 var POLL_BUDGET_MS = 270000;    // soft deadline ~4.5 min into the 6-min cap; remaining work resumes next run
 // R6: {swid -> global INR net, groupText} built once per poll run from get_friends; read by pollUpsertPerson_.
 var POLL_FRIEND_NET = null;
+// {swid -> Notion group page id} built once per poll run: people the owner shares EXACTLY ONE group
+// with, when that group is Allowed. Read by pollUpsertPerson_ to seed Default Group at creation only.
+var POLL_SOLO_GROUP = null;
 // §18 — AI-categorize Splitwise imports. New rows land as "Other"; an end-of-run Gemini pass
 // (fed the live allowed-category list) replaces that default with a real category.
 var POLL_PENDING_CAT = [];                   // {pageId, desc, hint} accumulated by pollUpsertExpense_ creates
@@ -1705,6 +1708,32 @@ function pollBuildFriendNetMap_(friends, gnameById) {
   return { net: net, groupText: groupText };
 }
 
+// Build {swid -> Notion group page id} for people the owner shares EXACTLY ONE group with, when
+// that group is Allowed. Read at person-creation time (pollUpsertPerson_) to seed Default Group.
+// get_groups only returns groups the owner is in, so "one group" means "one group shared with you".
+function pollBuildSoloGroupMap_(groupsResp, allowedList) {
+  var count = {}, oneGid = {};
+  var groups = (groupsResp && groupsResp.groups) || [];
+  for (var g = 0; g < groups.length; g++) {
+    var mem = groups[g].members || [];
+    for (var m = 0; m < mem.length; m++) {
+      var uid = mem[m] && mem[m].id;
+      if (!uid) continue;
+      count[uid] = (count[uid] || 0) + 1;
+      oneGid[uid] = groups[g].id;   // only meaningful when count === 1
+    }
+  }
+  var pageByGid = {};
+  for (var a = 0; a < (allowedList || []).length; a++) pageByGid[allowedList[a].gid] = allowedList[a].pageId;
+  var solo = {};
+  for (var uid2 in count) {
+    if (count[uid2] !== 1) continue;
+    var pg = pageByGid[oneGid[uid2]];
+    if (pg) solo[uid2] = pg;
+  }
+  return solo;
+}
+
 // Signature of the Splitwise contact roster (friends + group members). The contacts-DB refresh
 // is skipped when this hasn't changed — the priciest idle pass becomes one string compare.
 function pollContactsSig_(friends, groups) {
@@ -1867,6 +1896,11 @@ function pollUpsertPerson_(cfg, sw, ownerId, ownerName, idToName, cache) {
     if (!isOwner && firstName && firstName.toLowerCase() !== display.toLowerCase()) {
       props["Aliases"] = { rich_text: [{ text: { content: firstName } }] };
     }
+    // Seed Default Group when this person shares exactly one Allowed group with the owner
+    // (POLL_SOLO_GROUP is built once per run). Create-time only — never touches an existing row,
+    // so a default you later clear or change is never overridden.
+    var soloPage = (POLL_SOLO_GROUP && !isOwner) ? POLL_SOLO_GROUP[swid] : null;
+    if (soloPage) props["Default Group"] = { relation: [{ id: soloPage }] };
     var np = pollNotion_(cfg, "POST", "pages", { parent: { database_id: cfg.db.people }, properties: props });
     pid = np.id;
   }
@@ -2653,6 +2687,7 @@ function pollSplitwise(opts) {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(2000)) { logToSheet("pollSplitwise: lock busy, skipping this run."); return { ok: false, reason: "lock busy" }; }
   POLL_FRIEND_NET = null;  // R6: rebuilt each run from get_friends
+  POLL_SOLO_GROUP = null;  // rebuilt each run once Allowed groups are known
   POLL_PENDING_CAT = [];   // §18: this run's imports awaiting Gemini categorization
   var pollStart = Date.now();   // soft time budget — stop cleanly instead of being killed at 6 min
   try {
@@ -2708,12 +2743,16 @@ function pollSplitwise(opts) {
     try { pollSuggestCandidates_(cfg); } catch (ec) { logToSheet("pollSuggestCandidates_ err: " + ec); }
     pollRefreshBalances_(cfg, ownerId);  // R6 — keep every mapped person's Net Balance current
 
+    // §13.3 — the Allowed set (Notion Groups.Allowed) is resolved BEFORE any import so people created
+    // during import can be seeded with a Default Group. POLL_SOLO_GROUP maps swid -> group page when
+    // the owner shares exactly one Allowed group with that person (applied at creation only).
+    var allowed = pollGetAllowedGroups_(cfg);
+    POLL_SOLO_GROUP = pollBuildSoloGroupMap_(groupsResp, allowed);
+
     // §17.6 — import non-group (friend) expenses. Runs regardless of Allowed groups.
     var ng = { created: 0, updated: 0, archived: 0 };
     try { ng = pollNonGroupExpenses_(cfg, token, ownerId, ownerName, friendsList); } catch (eng) { logToSheet("pollNonGroupExpenses_ err: " + eng); }
 
-    // §13.3 — the allowed set is controlled in Notion (Groups.Allowed).
-    var allowed = pollGetAllowedGroups_(cfg);
     var created = 0, updated = 0, archived = 0, skippedGroups = 0, backfilling = 0, budgetHit = false;
     for (var gi = 0; gi < allowed.length; gi++) {
       if (Date.now() - pollStart > POLL_BUDGET_MS) {
