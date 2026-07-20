@@ -507,15 +507,37 @@ def main():
 
   Script Properties are the ONLY config store in IronBank - this script will
   add the non-secret keys automatically in the next step.""")
+    secrets = [("TELEGRAM_BOT_TOKEN", telegram_token),
+               ("GEMINI_API_KEY", gemini_key),
+               ("SPLITWISE_TOKEN", splitwise_token),
+               ("NOTION_TOKEN", NOTION_TOKEN)]
+    info("""
+  To fill each value, either:
+    'copy' - put each secret on your clipboard one at a time, so you just paste
+             into Script Properties (no terminal text-selecting, no accidental
+             Ctrl+C killing the wizard). Recommended.
+    'show' - print all four once so you can copy them from the terminal.
+    Enter  - skip (you'll copy them from BotFather / AI Studio / Splitwise / Notion).""")
     try:
-        show = input("  Type 'show' to print the secret values once for pasting, or Enter to skip: ").strip()
+        choice = input("  Choose [copy/show/Enter]: ").strip().lower()
     except EOFError:
-        show = ""
-    if show == "show":
-        info("      TELEGRAM_BOT_TOKEN = %s" % telegram_token)
-        info("      GEMINI_API_KEY     = %s" % gemini_key)
-        info("      SPLITWISE_TOKEN    = %s" % splitwise_token)
-        info("      NOTION_TOKEN       = %s" % NOTION_TOKEN)
+        choice = ""
+    if choice == "copy":
+        for name, val in secrets:
+            if copy_to_clipboard(val):
+                prompt = "  ✓ %s is on your clipboard - paste it into Script Properties, then Enter for the next... " % name
+            else:
+                info("      %-18s = %s" % (name, val))
+                prompt = "  (clipboard unavailable - value shown above) Enter for the next... "
+            try:
+                input(prompt)
+            except EOFError:
+                break
+        copy_to_clipboard("ironbank")   # overwrite so the last secret doesn't linger on the clipboard
+        ok("All four copied. Clipboard overwritten so no secret is left on it.")
+    elif choice == "show":
+        for name, val in secrets:
+            info("      %-18s = %s" % (name, val))
         warn("Clear your terminal scrollback after pasting.")
     pause()
 
