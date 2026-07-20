@@ -512,29 +512,47 @@ def main():
                ("SPLITWISE_TOKEN", splitwise_token),
                ("NOTION_TOKEN", NOTION_TOKEN)]
     info("""
-  To fill each value, either:
-    'copy' - put each secret on your clipboard one at a time, so you just paste
-             into Script Properties (no terminal text-selecting, no accidental
-             Ctrl+C killing the wizard). Recommended.
-    'show' - print all four once so you can copy them from the terminal.
+  Each property has two fields - a Property NAME and a Value. Choose:
+    'copy' - walk through all four, copying the NAME then the VALUE to your
+             clipboard in turn. You just paste each into its field (no typing,
+             no terminal text-selecting, no accidental Ctrl+C killing the
+             wizard). Recommended.
+    'show' - print all four name=value pairs once to copy from the terminal.
     Enter  - skip (you'll copy them from BotFather / AI Studio / Splitwise / Notion).""")
     try:
         choice = input("  Choose [copy/show/Enter]: ").strip().lower()
     except EOFError:
         choice = ""
     if choice == "copy":
+        info("  In Apps Script: Add script property, then for each below paste the name,")
+        info("  Tab to the Value field, paste the value.")
+        aborted = False
         for name, val in secrets:
-            if copy_to_clipboard(val):
-                prompt = "  ✓ %s is on your clipboard - paste it into Script Properties, then Enter for the next... " % name
+            # 1) the property NAME
+            if copy_to_clipboard(name):
+                prompt = "  ✓ NAME '%s' copied - paste it into the Property field, then Enter... " % name
             else:
-                info("      %-18s = %s" % (name, val))
-                prompt = "  (clipboard unavailable - value shown above) Enter for the next... "
+                info("      Property: %s" % name)
+                prompt = "  (clipboard unavailable - name shown above) Enter... "
             try:
                 input(prompt)
             except EOFError:
+                aborted = True
+                break
+            # 2) its VALUE
+            if copy_to_clipboard(val):
+                prompt = "    ...VALUE copied - Tab to the Value field, paste, then Enter for the next... "
+            else:
+                info("      Value:    %s" % val)
+                prompt = "    (clipboard unavailable - value shown above) Enter for the next... "
+            try:
+                input(prompt)
+            except EOFError:
+                aborted = True
                 break
         copy_to_clipboard("ironbank")   # overwrite so the last secret doesn't linger on the clipboard
-        ok("All four copied. Clipboard overwritten so no secret is left on it.")
+        if not aborted:
+            ok("All four copied. Clipboard overwritten so no secret is left on it.")
     elif choice == "show":
         for name, val in secrets:
             info("      %-18s = %s" % (name, val))
