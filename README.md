@@ -38,6 +38,10 @@ SETTLE     Splitwise — native settlement + authoritative balances
 
 ## Setup (~20 minutes, once)
 
+**Step 0 — start from the Notion template (recommended).** Open the [IronBank Notion template](https://app.notion.com/p/IronBank-Template-3a3f0556bd7e80bfb29fd0c67e04168a?source=copy_link), click **Duplicate** into your own workspace, then share *your copy* with your Notion integration (page ••• menu → Connections). Copy your duplicated page's URL — you'll paste it when the script asks for your Notion parent page. The 4 databases and the dashboard views come pre-built, empty, and ready to go; the script detects them by name and reuses them instead of creating new ones.
+
+Don't want to use the template? Share any blank page instead — the script will create the databases from scratch, and you'll build the dashboard views yourself at the end (see the last row below).
+
 ```bash
 git clone https://github.com/manideep1108/IronBank.git
 cd IronBank
@@ -49,7 +53,7 @@ The script walks you through everything and automates what can be automated:
 | Step | Automated? | What happens |
 |---|---|---|
 | Collect + validate credentials | ✅ | Telegram bot token, Gemini API key, Splitwise Personal Access Token, Notion integration token + parent page — each verified live. Your Telegram chat id is pinned up front (required — prevents bot hijack) |
-| Provision the 4 Notion databases | ✅ | Exact schema incl. formulas, relations, and the select options that drive the parser. Idempotent — re-runs reuse saved database ids (survives renames) and only add what's missing |
+| Provision the 4 Notion databases | ✅ | Idempotent — detects databases already there (e.g. from duplicating the template) by name and pulls their ids; only creates from scratch, with the exact schema/formulas/relations, if they don't exist yet |
 | Apps Script project + loader paste | 🖐 guided | [script.new](https://script.new), paste `google_apps_script_loader.js` once (the script puts it on your clipboard) |
 | Secrets → Script Properties | 🖐 guided | Google has no API for Script Properties (which is why secrets belong there) |
 | Deploy the Web App | 🖐 guided | Execute as **Me**, access **Anyone** |
@@ -57,9 +61,9 @@ The script walks you through everything and automates what can be automated:
 | Verify the pasted secrets | ✅ | `diagnose` live-tests every secret inside Apps Script and reports pass/fail per key — a typo'd token is caught immediately, not at the first silent sync failure |
 | Install the 15-min sync trigger | ✅ | Installed through the Web App (it executes as you); fallback: run `installPollTrigger` in the editor |
 | Run the first sync | ✅ | Your Splitwise groups + contacts are already in Notion before the script exits |
-| Build the Notion views | 🖐 once | The Notion API cannot create views — open [dashboard_build_guide.html](dashboard_build_guide.html) (or [DASHBOARD.md](DASHBOARD.md)) |
+| Build the Notion views | 🖐 once, skip if using the template | The Notion API cannot create views — open [dashboard_build_guide.html](dashboard_build_guide.html) (or [DASHBOARD.md](DASHBOARD.md)). Already done for you if you duplicated the template — the views come along with the duplicate |
 
-**Credentials you'll need:** a Telegram bot ([@BotFather](https://t.me/BotFather)), a Gemini API key ([AI Studio](https://aistudio.google.com/apikey)), a Splitwise Personal Access Token ([register an app](https://secure.splitwise.com/apps)), and a Notion internal integration ([my-integrations](https://www.notion.so/my-integrations)) shared to one parent page.
+**Credentials you'll need:** a Telegram bot ([@BotFather](https://t.me/BotFather)), a Gemini API key ([AI Studio](https://aistudio.google.com/apikey)), a Splitwise Personal Access Token ([register an app](https://secure.splitwise.com/apps)), and a Notion internal integration ([my-integrations](https://www.notion.so/my-integrations)) shared to one parent page (your duplicated template, or a blank page).
 
 ### Running on Windows
 

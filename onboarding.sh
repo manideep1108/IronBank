@@ -89,8 +89,11 @@ echo "  • Telegram bot token  → create a bot with @BotFather, copy the token
 echo "  • Gemini API key      → https://aistudio.google.com/apikey"
 echo "  • Splitwise PAT       → https://secure.splitwise.com/apps → Register app → Personal Access Token"
 echo "  • Notion token        → https://www.notion.so/my-integrations → New integration (internal)"
-echo "  • Notion parent page  → the page that will hold the 4 databases. SHARE it with the"
-echo "                          integration first: page ••• menu → Connections → your integration"
+echo "  • Notion parent page  → recommended: duplicate the IronBank template into your workspace"
+echo "                          (https://app.notion.com/p/IronBank-Template-3a3f0556bd7e80bfb29fd0c67e04168a),"
+echo "                          then use YOUR copy's page. Or share any blank page — the script"
+echo "                          creates the databases from scratch either way. SHARE the page with"
+echo "                          the integration first: page ••• menu → Connections → your integration"
 echo
 
 ask TELEGRAM_BOT_TOKEN "Telegram bot token" secret
@@ -150,15 +153,19 @@ fi
 ok "Chat id pinned: ${TELEGRAM_CHAT_ID}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-bold "STEP 2/6 — Provision the 4 Notion databases (idempotent)"
+bold "STEP 2/6 — Link the 4 Notion databases (idempotent)"
 # ─────────────────────────────────────────────────────────────────────────────
-# Creates Groups → Splitwise Users → People → Expenses under the parent page
-# (creation order matters: relations need the target database id to exist).
+# If Groups / Splitwise Users / People / Expenses already exist under the parent
+# page (e.g. you duplicated the template), they're found by exact title and their
+# ids are pulled directly — nothing is created or duplicated. Only missing
+# databases get created from scratch (Groups → Splitwise Users → People →
+# Expenses order matters: relations need the target database id to exist).
 # Re-run behaviour: prefers the database ids saved in the state file (survives
 # renames), then finds existing child databases by exact title, and PATCHes
-# in any missing properties. Select options are seeded only when the property
-# itself is created — after that the live dropdowns are YOURS: adding an option
-# in Notion feeds the parser directly.
+# in any missing properties — this also self-heals a template whose schema
+# drifted from an older version. Select options are seeded only when the
+# property itself is created — after that the live dropdowns are YOURS: adding
+# an option in Notion feeds the parser directly.
 NOTION_TOKEN="$NOTION_TOKEN" PARENT="$NOTION_PARENT_PAGE_ID" "$PY" - <<'PYEOF' > "$STATE_FILE.tmp"
 import json, os, sys, time, urllib.request
 
@@ -489,10 +496,12 @@ cat <<EOS
      Candidates column for suggested matches). Default Group is optional:
      leave it empty to settle with them as direct friend expenses.
 
-  4. VIEWS (manual — the Notion API cannot create views): build the dashboard
-     once. Open  dashboard_build_guide.html  from this repository in your
-     browser — it tracks your progress as you build (DASHBOARD.md is the
-     plain-text version of the same guide).
+  4. VIEWS: if your Notion page already shows sections like "Balances at a
+     Glance" and "Needs Your Attention" (from duplicating the template),
+     you're done — skip this. Otherwise (manual — the Notion API cannot create
+     views): build the dashboard once. Open  dashboard_build_guide.html  from
+     this repository in your browser — it tracks your progress as you build
+     (DASHBOARD.md is the plain-text version of the same guide).
 
   Smoke test: send  "100 chai me and <a friend>"  to @${BOT_USER} — you should
   get a parsed split reply, a row in Notion Expenses, and (once that friend
