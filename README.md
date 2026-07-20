@@ -48,6 +48,8 @@ cd IronBank
 ./onboarding.sh
 ```
 
+**No git?** Use the green **Code → Download ZIP** button on GitHub instead, extract it, and run the same script from inside the extracted folder. One difference: GitHub's ZIP export doesn't preserve the executable bit, so `./onboarding.sh` may say "Permission denied" — run `bash onboarding.sh` instead (or on Windows, see below). Everything else is identical.
+
 The script walks you through everything and automates what can be automated:
 
 | Step | Automated? | What happens |
@@ -67,18 +69,25 @@ The script walks you through everything and automates what can be automated:
 
 ### Running on Windows
 
-`onboarding.sh` is a bash script, and it runs on Windows as-is inside **Git Bash** — there is no separate `.ps1`/`.bat` version to keep in sync. One-time setup:
+`onboarding.sh` is a bash script and needs **Git Bash** underneath either way — there's no separate implementation to keep in sync, just two ways to launch the same script. One-time setup:
 
 1. Install [Git for Windows](https://gitforwindows.org) (bundles **Git Bash** and `curl`).
 2. Install [Python 3](https://www.python.org/downloads/windows/) and tick **"Add python.exe to PATH"** in the installer.
-3. Open **Git Bash** (Start menu), then run the same three commands as above:
-   ```bash
-   git clone https://github.com/manideep1108/IronBank.git
-   cd IronBank
-   ./onboarding.sh
-   ```
+3. Either:
+   - **From a plain `cmd.exe` window** (double-clicking `onboarding.sh` itself won't work — Windows doesn't know what a `.sh` file is): run `onboarding.bat` instead. It's a thin wrapper that finds Git Bash and runs `onboarding.sh` through it — same script, same prompts, just launchable from cmd.
+     ```bat
+     git clone https://github.com/manideep1108/IronBank.git
+     cd IronBank
+     onboarding.bat
+     ```
+   - **From Git Bash** (Start menu), run the same three commands as the top of this section:
+     ```bash
+     git clone https://github.com/manideep1108/IronBank.git
+     cd IronBank
+     ./onboarding.sh
+     ```
 
-Notes: paste into Git Bash with right-click or `Shift+Insert`; the script copies the Apps Script loader to your clipboard automatically (via `clip.exe`); line endings are pinned to LF by `.gitattributes`, so the default `autocrlf` clone setting can't break the script. Prefer **WSL**? That works identically — `sudo apt install curl python3` if they're missing, then the same three commands.
+Notes: paste into Git Bash with right-click or `Shift+Insert`; the script copies the Apps Script loader to your clipboard automatically (via `clip.exe`); line endings are pinned to LF by `.gitattributes`, so the default `autocrlf` clone setting can't break the script. `onboarding.bat` isn't affected by the ZIP-download executable-bit issue mentioned above — it invokes bash directly on the script file regardless of permissions. Prefer **WSL**? That works identically to Git Bash — `sudo apt install curl python3` if they're missing, then the same three commands.
 
 ## Daily use
 
