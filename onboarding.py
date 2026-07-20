@@ -19,19 +19,22 @@
 #       all relations, and the seeded Expense Type / Payment Mode options that
 #       drive the parser. Re-runs prefer the database ids saved in the state
 #       file (survives renames), then fall back to title matching.
-#    3. After you deploy the Apps Script Web App, pushes all NON-SECRET config
-#       into Script Properties through the Web App's updateConfig action, and
-#       registers the Telegram webhook.
-#    4. LIVE-VERIFIES every secret you pasted (diagnose - pass/fail only,
-#       values never leave Apps Script), INSTALLS the 15-min sync trigger
-#       through the Web App, and RUNS THE FIRST SYNC so your Splitwise groups
-#       and contacts are already in Notion when you open it.
+#    3. After you deploy the Apps Script Web App, pushes the non-secret config
+#       AND the three non-bootstrap secrets (Gemini, Splitwise, Notion) into
+#       Script Properties through the Web App's updateConfig action, and
+#       registers the Telegram webhook. Only TELEGRAM_BOT_TOKEN is set by hand
+#       (it's the key updateConfig authenticates with, so it must exist first).
+#    4. LIVE-VERIFIES every secret via diagnose (pass/fail only, values never
+#       leave Apps Script), INSTALLS the 15-min sync trigger through the Web
+#       App, and RUNS THE FIRST SYNC so your Splitwise groups and contacts are
+#       already in Notion when you open it.
 #
 #  What it CANNOT automate (guided manual steps - no API exists for them):
 #    A. Creating the Apps Script project (script.new) + pasting the loader
 #       (this script copies the loader to your clipboard when it can).
-#    B. Setting the four SECRETS in Script Properties (Google offers no public
-#       API for Script Properties - and that's where secrets belong).
+#    B. Setting the ONE bootstrap secret TELEGRAM_BOT_TOKEN in Script Properties
+#       (Google offers no public API for Script Properties; the rest are pushed
+#       for you once this one is in place and the Web App is deployed).
 #    C. Deploying the Web App (interactive Google authorization).
 #    D. Sharing the Notion parent page with your integration.
 #    E. Building the Notion VIEWS - the Notion API cannot create views. Follow
@@ -494,68 +497,48 @@ def main():
 
     # ── STEP 4 ────────────────────────────────────────────────────────────────
     print()
-    bold("STEP 4/6 - Secrets -> Script Properties (manual - Google has no API for this)")
-    info("""  In the Apps Script editor: Project Settings -> Script Properties -> Add:
+    bold("STEP 4/6 - Set ONE secret to bootstrap (Google has no API for Script Properties)")
+    info("""  You only set ONE secret by hand - TELEGRAM_BOT_TOKEN. It's the key the
+  next step authenticates with, so it has to be in place first; the script then
+  pushes the other three secrets (Gemini, Splitwise, Notion) for you after you
+  deploy, over the same authenticated channel.
+
+  In the Apps Script editor: Project Settings -> Script Properties -> Add:
 
       Property               Value
       ---------------------  ---------------------------------------------
-      TELEGRAM_BOT_TOKEN     (the bot token you entered in step 1)
-      GEMINI_API_KEY         (the Gemini key you entered in step 1)
-      SPLITWISE_TOKEN        (the Splitwise PAT you entered in step 1)
-      NOTION_TOKEN           (the Notion token you entered in step 1)
-      GITHUB_TOKEN           (only if you run a private fork)
-
-  Script Properties are the ONLY config store in IronBank - this script will
-  add the non-secret keys automatically in the next step.""")
-    secrets = [("TELEGRAM_BOT_TOKEN", telegram_token),
-               ("GEMINI_API_KEY", gemini_key),
-               ("SPLITWISE_TOKEN", splitwise_token),
-               ("NOTION_TOKEN", NOTION_TOKEN)]
+      TELEGRAM_BOT_TOKEN     (the bot token you entered in step 1)""")
     info("""
-  Each property has two fields - a Property NAME and a Value. Choose:
-    'copy' - walk through all four, copying the NAME then the VALUE to your
-             clipboard in turn. You just paste each into its field (no typing,
-             no terminal text-selecting, no accidental Ctrl+C killing the
-             wizard). Recommended.
-    'show' - print all four name=value pairs once to copy from the terminal.
-    Enter  - skip (you'll copy them from BotFather / AI Studio / Splitwise / Notion).""")
+  The property has two fields - a Property NAME and a Value. Choose:
+    'copy' - copy the NAME, then the VALUE, to your clipboard so you just paste
+             each into its field (no typing, no terminal text-selecting, no
+             accidental Ctrl+C killing the wizard). Recommended.
+    'show' - print the name=value pair once to copy from the terminal.
+    Enter  - skip (you'll copy the token from your BotFather chat).""")
     try:
         choice = input("  Choose [copy/show/Enter]: ").strip().lower()
     except EOFError:
         choice = ""
     if choice == "copy":
-        info("  In Apps Script: Add script property, then for each below paste the name,")
-        info("  Tab to the Value field, paste the value.")
-        aborted = False
-        for name, val in secrets:
-            # 1) the property NAME
-            if copy_to_clipboard(name):
-                prompt = "  ✓ NAME '%s' copied - paste it into the Property field, then Enter... " % name
+        info("  In Apps Script: click Add script property, then:")
+        if copy_to_clipboard("TELEGRAM_BOT_TOKEN"):
+            _p = "  ✓ NAME 'TELEGRAM_BOT_TOKEN' copied - paste it into the Property field, then Enter... "
+        else:
+            info("      Property: TELEGRAM_BOT_TOKEN")
+            _p = "  (clipboard unavailable - name shown above) Enter... "
+        try:
+            input(_p)
+            if copy_to_clipboard(telegram_token):
+                input("    ...VALUE copied - Tab to the Value field, paste, then Save. Enter to continue... ")
             else:
-                info("      Property: %s" % name)
-                prompt = "  (clipboard unavailable - name shown above) Enter... "
-            try:
-                input(prompt)
-            except EOFError:
-                aborted = True
-                break
-            # 2) its VALUE
-            if copy_to_clipboard(val):
-                prompt = "    ...VALUE copied - Tab to the Value field, paste, then Enter for the next... "
-            else:
-                info("      Value:    %s" % val)
-                prompt = "    (clipboard unavailable - value shown above) Enter for the next... "
-            try:
-                input(prompt)
-            except EOFError:
-                aborted = True
-                break
-        copy_to_clipboard("ironbank")   # overwrite so the last secret doesn't linger on the clipboard
-        if not aborted:
-            ok("All four copied. Clipboard overwritten so no secret is left on it.")
+                info("      Value:    %s" % telegram_token)
+                input("    (clipboard unavailable - value shown above) Save, then Enter to continue... ")
+        except EOFError:
+            pass
+        copy_to_clipboard("ironbank")   # overwrite so the token doesn't linger on the clipboard
+        ok("Clipboard overwritten so the token isn't left on it.")
     elif choice == "show":
-        for name, val in secrets:
-            info("      %-18s = %s" % (name, val))
+        info("      TELEGRAM_BOT_TOKEN = %s" % telegram_token)
         warn("Clear your terminal scrollback after pasting.")
     pause()
 
@@ -584,14 +567,22 @@ def main():
     else:
         die("Ping failed - is the Web App deployed with access 'Anyone'? Response: %s" % ping)
 
-    # Push each NON-SECRET key into Script Properties via the Web App's updateConfig.
-    def push_cfg(key, value):
+    # Push config into Script Properties via the Web App's updateConfig (auth: the
+    # bot token you just set). updateConfig doesn't log values; secrets ride the same
+    # authenticated HTTPS channel the bot token already uses. The 'quiet' flag lets
+    # us confirm a secret landed without naming it in a way that echoes its value.
+    def push_cfg(key, value, secret=False):
         out = web_app_post(webapp_url, {"action": "updateConfig", "secret": telegram_token,
                                         "key": key, "value": value})
         if '"success":true' in out:
-            ok("Config: %s" % key)
+            ok(("Secret set: %s" if secret else "Config: %s") % key)
         else:
             die("Failed to set %s - response: %s" % (key, out))
+
+    # The three non-bootstrap secrets, pushed for you (bot token was set by hand above).
+    push_cfg("GEMINI_API_KEY", gemini_key, secret=True)
+    push_cfg("SPLITWISE_TOKEN", splitwise_token, secret=True)
+    push_cfg("NOTION_TOKEN", NOTION_TOKEN, secret=True)
 
     push_cfg("OWNER_NAME", owner_name)
     push_cfg("NOTION_DB_EXPENSES", db_expenses)
