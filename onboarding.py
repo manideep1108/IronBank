@@ -72,6 +72,9 @@ STATE_FILE = os.path.join(SCRIPT_DIR, ".ironbank_onboarding_state.json")
 LOADER_FILE = os.path.join(SCRIPT_DIR, "google_apps_script_loader.js")
 SCHEMA_VERSION = "1"                # stamped into config for future schema migrations
 NOTION_VERSION = "2022-06-28"
+# Some APIs (Splitwise, behind Cloudflare) 403 the default "Python-urllib/x.y"
+# User-Agent as a suspected bot. A real UA sails through — set it on every request.
+USER_AGENT = "IronBank-Onboarding/1.0"
 
 # ── color / tty setup ────────────────────────────────────────────────────────
 _USE_COLOR = sys.stdout.isatty()
@@ -139,6 +142,7 @@ def ask(env_key, label, secret=False):
 def http_json(url, headers=None, method="GET", timeout=30):
     """GET/POST returning parsed JSON. Raises on any non-2xx (like curl -f)."""
     req = urllib.request.Request(url, method=method)
+    req.add_header("User-Agent", USER_AGENT)
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -153,6 +157,7 @@ def web_app_post(url, params, timeout=60):
     shell version did."""
     data = urllib.parse.urlencode(params).encode()
     req = urllib.request.Request(url, data=data)   # presence of data => POST
+    req.add_header("User-Agent", USER_AGENT)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read().decode("utf-8", "replace")
@@ -190,6 +195,7 @@ NOTION_TOKEN = ""   # set after step 1
 
 def notion(method, path, payload=None, quiet=False):
     req = urllib.request.Request("https://api.notion.com/v1/" + path, method=method)
+    req.add_header("User-Agent", USER_AGENT)
     req.add_header("Authorization", "Bearer " + NOTION_TOKEN)
     req.add_header("Notion-Version", NOTION_VERSION)
     if payload is not None:
