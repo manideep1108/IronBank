@@ -2147,6 +2147,39 @@ function pollCatalogGroups_(cfg, groups) {
         properties: { "Name": { title: [{ text: { content: nm } }] }, "Splitwise Group ID": { number: g.id } } });
     }
   }
+
+  // Prune groups that no longer exist on Splitwise (deleted, or you left them): archive the
+  // stale Notion catalog row so the Groups list mirrors Splitwise (reversible via Notion trash).
+  // Guarded on a non-empty live list, so a transient empty get_groups can't wipe the catalog.
+  // aliveIds is built from EVERY live group (incl. non-INR) so a group that merely turned non-INR
+  // isn't mistaken for deleted. Imported expense rows are left untouched (real history). Any person
+  // whose Default Group pointed at a pruned group is silently unassigned — they fall back to direct
+  // (non-group) settlement, a fully valid path; the admin can pick a new Default Group anytime.
+  if (groups.length) {
+    var aliveIds = {};
+    for (var a = 0; a < groups.length; a++) if (groups[a].id) aliveIds[groups[a].id] = true;
+    for (var gidKey in existing) {
+      if (aliveIds[gidKey]) continue;                       // still on Splitwise — keep it
+      var deadPageId = existing[gidKey].id;
+      // unassign anyone routing through this group (Default Group is a relation to this page)
+      try {
+        var pc = null;
+        do {
+          var pbody = { page_size: 100, filter: { property: "Default Group", relation: { contains: deadPageId } } };
+          if (pc) pbody.start_cursor = pc;
+          var pr = pollNotion_(cfg, "POST", "databases/" + cfg.db.people + "/query", pbody);
+          for (var pi = 0; pi < pr.results.length; pi++)
+            pollNotion_(cfg, "PATCH", "pages/" + pr.results[pi].id, { properties: { "Default Group": { relation: [] } } });
+          pc = pr.has_more ? pr.next_cursor : null;
+        } while (pc);
+      } catch (edg) { logToSheet("pollCatalogGroups_ prune: clearing Default Group for group " + gidKey + " failed: " + edg); }
+      // archive the stale group row (skipped from Allowed queries once archived, so no further fetches)
+      try {
+        pollNotion_(cfg, "PATCH", "pages/" + deadPageId, { archived: true });
+        logToSheet("pollCatalogGroups_: pruned Splitwise group " + gidKey + " — archived its Notion row.");
+      } catch (earch) { logToSheet("pollCatalogGroups_ prune: archiving group " + gidKey + " failed: " + earch); }
+    }
+  }
 }
 
 // §13.3/§13c — the allowed set is controlled in Notion (Groups.Allowed) and nowhere else.

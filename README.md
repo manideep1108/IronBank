@@ -88,6 +88,7 @@ Notes: the script copies the Apps Script loader to your clipboard automatically 
 
 - **Log:** message the bot. It replies with the parsed split (canonical names — so a wrong guess is immediately visible), a 🗑️ Delete button, and where it settled on Splitwise.
 - **Onboard a Splitwise group:** tick `Allowed` on its row in the Notion **Groups** database. The next sync backfills its full history once, then keeps it current.
+- **A group you delete (or leave) on Splitwise** disappears from the Notion **Groups** list on the next sync (its row is archived, recoverable from Notion trash). Its already-imported expense rows are kept as history, and anyone who had it as their `Default Group` is quietly unassigned (they then settle directly — pick a new `Default Group` for them if you want group routing).
 - **Set up a person:** when a new name appears in **People**, pick their **Splitwise Identity** from the dropdown (the **Candidates** column suggests likely matches). `Default Group` is optional — without it they settle as direct friend expenses.
 - **Fix a nickname/duplicate:** set **Merge Into** on the stray row; the next sync folds it into the real person and remembers the nickname.
 - **Delete/redo an expense:** tap 🗑️ in Telegram, or set **Sync Action** to `Delete` / `Re-push` on the Notion row.
