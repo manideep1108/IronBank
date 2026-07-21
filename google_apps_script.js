@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.3.0";
+var IRONBANK_VERSION = "1.3.1";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -2310,6 +2310,18 @@ function pollBackfillGroup_(cfg, token, gid, ownerId, idToName, memberById, pers
 // by either of its IDs. `contains` is a substring match ("123" also matches "4123"), so every
 // candidate is verified in code for exact membership in its comma list — returning a substring
 // collision here would PATCH the wrong row with this expense's data.
+// §19 — CacheService is visible across separate script executions (unlike a plain JS variable),
+// so it closes the gap LockService can't: two non-overlapping runs where the second's Notion query
+// doesn't yet reflect the first's just-committed create. 21600s = CacheService's max TTL; the
+// duplicate-create window this guards against is seconds wide, so the generous TTL costs nothing.
+var POLL_SWID_CREATED_TTL = 21600;
+function pollSwidRecentlyCreated_(swid) {
+  try { return !!CacheService.getScriptCache().get("swid_created_" + swid); } catch (e) { return false; }
+}
+function pollMarkSwidCreated_(swid) {
+  try { CacheService.getScriptCache().put("swid_created_" + swid, "1", POLL_SWID_CREATED_TTL); } catch (e) {}
+}
+
 function pollFindExpense_(cfg, swid) {
   var r = pollNotion_(cfg, "POST", "databases/" + cfg.db.expenses + "/query",
     { filter: { property: "Splitwise ID", rich_text: { contains: String(swid) } } });
@@ -2363,6 +2375,14 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
   if (uids.indexOf(ownerId) < 0) return "skip";                  // owner not a participant — not our activity
 
   var page = pollFindExpense_(cfg, swid);
+  // §19 — cross-run duplicate-create guard: LockService only blocks *overlapping* pollSplitwise()
+  // runs; it doesn't cover Notion's own query index briefly lagging a just-committed create, which
+  // let two "MGL GAS" rows get created for the same swid moments apart in production. If a very
+  // recent run marked this swid as created, retry the lookup briefly before trusting "not found" —
+  // proceeding straight to create on a stale miss is exactly what produced that duplicate.
+  if (!page && pollSwidRecentlyCreated_(swid)) {
+    for (var dupRetry = 0; dupRetry < 3 && !page; dupRetry++) { Utilities.sleep(400); page = pollFindExpense_(cfg, swid); }
+  }
   if (page && pollRichText_(page.properties["Splitwise Updated At"]) === (e.updated_at || "")) return "skip";
   // §13b composite guard: a row whose Splitwise ID is a list (owner-created across multiple groups)
   // must not be clobbered by one group-expense's inbound data. Leave composite rows to the owner side.
@@ -2423,6 +2443,7 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
   props["Payment Mode"] = { select: { name: "Unknown" } };
   props["Source"] = { select: { name: "Splitwise" } };
   var createdPage = pollNotion_(cfg, "POST", "pages", { parent: { database_id: cfg.db.expenses }, properties: props });
+  pollMarkSwidCreated_(swid);   // §19 — close the window for the next run's query-lag retry above
   // §18 — queue for the end-of-run Gemini pass; Splitwise's own category rides along as a hint.
   if (createdPage && createdPage.id) {
     POLL_PENDING_CAT.push({ pageId: createdPage.id, desc: desc, hint: (e.category && e.category.name) || "" });
