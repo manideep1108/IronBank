@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.4.1";
+var IRONBANK_VERSION = "1.4.2";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -476,7 +476,7 @@ function processExpenseText(text, geminiKey, token, chatId, messageId, ownerName
       "   - fixed_splits: People who owe a specific fixed amount (e.g. A had 800).\n" +
       "   - weighted_splits: People who share the remainder. Give a weight of 1 to each person splitting the remainder equally (e.g. if A, B, C split equally, add each with weight: 1).\n" +
       "   - If the total amount is split equally among everyone (e.g. A and B split 50-50), leave fixed_splits empty, and put them in weighted_splits with weight 1.\n" +
-      "3. Categorize the expense. Select the category that fits the most from the allowed categories list. If nothing fits, use 'Other'.\n" +
+      "3. Categorize the expense. Select the category that fits the most from the allowed categories list. If nothing fits, use 'Other'. If the user explicitly states a category, use that exact category (as long as it's in the allowed list) — a stated category always takes precedence over your own guess.\n" +
       "4. For relative dates like 'yesterday', calculate the correct YYYY-MM-DD relative to " + today + ".\n" +
       "5. Identify the payment mode. Map terms like 'gpay', 'phonepe', 'upi' to 'UPI', 'cc' or 'card' to 'Credit Card', 'cash' to 'Cash'. User overrides take precedence.\n" +
       "6. Calculate the total_amount: If the transaction amount in the text is a mathematical expression (e.g., contains addition '+', subtraction '-', or multiplication '*'), evaluate the expression to find the final single numeric result (e.g., '793-245' must be evaluated to 548) and return that evaluated number as the total_amount. Do not just return the first number.\n" +
@@ -775,7 +775,7 @@ function processReceiptPhoto(photoArray, caption, geminiKey, token, chatId, mess
       "   - fixed_splits: People who owe a specific fixed amount (e.g. A had 800).\n" +
       "   - weighted_splits: People who share the remainder. Give a weight of 1 to each person splitting the remainder equally (e.g. A, B, C split equally, add each with weight: 1).\n" +
       "   - If the user caption is empty or does not mention split directions, leave fixed_splits empty, and put only the owner '" + ownerName + "' in weighted_splits with weight 1.\n" +
-      "5. Map the transaction category to one of the allowed categories. If no category fits, use 'Other'.\n" +
+      "5. Map the transaction category to one of the allowed categories. If no category fits, use 'Other'. If the user caption explicitly states a category, use that exact category (as long as it's in the allowed list) — a stated category always takes precedence over your own guess.\n" +
       "6. Map the payment method to one of the allowed payment modes. Map cards/numbers to 'Credit Card' or matching card name, UPI keywords to 'UPI', cash to 'Cash'. User caption overrides take precedence.\n" +
       "7. If the user caption has a mathematical expression for the amount, or if any person's split instructions in the caption contain math expressions, evaluate the expression to a single numeric value before outputting it.\n" +
       "8. For per-item lists on the receipt/invoice with mixed or complex split groupings specified in the caption (e.g., 'item 1 split between A and B, rest split between A, B, and me'):\n" +
