@@ -254,17 +254,17 @@ def schema_people(groups_id, swusers_id):
             # "Merge Into" (self-relation) is PATCHed in afterwards
 
 
-def schema_expenses(people_id):
+def schema_expenses(people_id, groups_id, categories, payment_modes):
     return {"Description": {"title": {}},
             "Amount": {"number": {"format": "rupee"}},        # YOUR share
             "Total Amount": {"number": {"format": "rupee"}},  # full bill
             "Date": {"date": {}},
             # Month/Year formulas PATCHed in afterwards (they reference Date)
-            "Expense Type": sel("Food", "Travel", "Shopping", "Utilities",
-                                "Medical", "Entertainment", "Rent", "Groceries", "Other"),
+            "Expense Type": sel(*categories),                 # seeded from onboarding (always incl. Other)
             "Comments": rt(),
             "Payer": rel(people_id),
-            "Payment Mode": sel("UPI", "Cash", "Credit Card", "Debit Card", "Unknown"),
+            "Group": rel(groups_id),                      # source group (shows the group name)
+            "Payment Mode": sel(*payment_modes),          # seeded from onboarding (always incl. Unknown)
             "Source": sel("Telegram", "Telegram Receipt Scanning", "Splitwise", "Manual"),
             "Splitwise ID": rt(), "Splitwise Group ID": rt(), "Splitwise Updated At": rt(),
             "Splits Summary": rt(),
@@ -275,10 +275,12 @@ def schema_expenses(people_id):
             "Sync Status": rt()}
 
 
-def provision_notion(parent):
+def provision_notion(parent, categories, payment_modes):
     """Idempotently ensure the 4 databases exist under the parent page and return
     their ids. Prefers state-file ids (survives renames), then existing child
-    databases by exact title, else creates. Missing properties are PATCHed in."""
+    databases by exact title, else creates. Missing properties are PATCHed in.
+    `categories` / `payment_modes` seed the Expenses Expense Type / Payment Mode
+    dropdowns when the Expenses DB is created fresh."""
     # inventory existing child databases of the parent page by title
     existing = {}
     cursor = None
@@ -336,7 +338,7 @@ def provision_notion(parent):
     groups_id   = ensure_db("Groups", schema_groups(), "\U0001F465", "NOTION_DB_GROUPS")
     swusers_id  = ensure_db("Splitwise Users", schema_swusers(), "\U0001F4C7", "NOTION_DB_SW_USERS")
     people_id   = ensure_db("People", schema_people(groups_id, swusers_id), "\U0001F9D1", "NOTION_DB_PEOPLE")
-    expenses_id = ensure_db("Expenses", schema_expenses(people_id), "\U0001F9FE", "NOTION_DB_EXPENSES")
+    expenses_id = ensure_db("Expenses", schema_expenses(people_id, groups_id, categories, payment_modes), "\U0001F9FE", "NOTION_DB_EXPENSES")
 
     # post-create PATCHes: self-relation + formulas (both idempotent)
     pdb = notion("GET", "databases/%s" % people_id)
@@ -464,8 +466,60 @@ def main():
     # title and reused - nothing is created or duplicated. Only missing databases
     # are created from scratch. Missing properties on an existing (possibly older)
     # template are PATCHed in, self-healing schema drift.
+
+    # Expense categories seed the Expense Type dropdown that the parser + auto-categorizer use.
+    # Only applied when the Expenses DB is created fresh (a template duplicate keeps its own list).
+    # "Other" is always kept as the catch-all the code falls back to, whether or not you list it.
+    default_cats = ["Food", "Travel", "Shopping", "Utilities", "Medical",
+                    "Entertainment", "Rent", "Groceries", "Other"]
+    cats_env = os.environ.get("EXPENSE_CATEGORIES", "").strip()
+    if cats_env:
+        raw = cats_env
+    else:
+        info("  Expense categories (comma-separated) seed the Expense Type dropdown.")
+        info("  Default: " + ", ".join(default_cats))
+        try:
+            raw = input("  Categories [Enter for default]: ").strip()
+        except EOFError:
+            raw = ""
+    raw_cats = [c.strip() for c in raw.split(",") if c.strip()] if raw else list(default_cats)
+    # Drop any case-variant of "other" and de-dupe (case-insensitive), then append the canonical
+    # "Other" last — the code's catch-all is exactly "Other", and Notion selects are case-sensitive.
+    _seen, categories = set(), []
+    for c in raw_cats:
+        if c.lower() == "other" or c.lower() in _seen:
+            continue
+        _seen.add(c.lower())
+        categories.append(c)
+    categories.append("Other")
+    ok("Categories: " + ", ".join(categories))
+
+    # Payment modes seed the Payment Mode dropdown the parser uses. Same rules as categories:
+    # applied only when the Expenses DB is created fresh; "Unknown" is always kept as the catch-all
+    # the code falls back to, whether or not you list it.
+    default_modes = ["UPI", "Cash", "Credit Card", "Debit Card", "Unknown"]
+    modes_env = os.environ.get("PAYMENT_MODES", "").strip()
+    if modes_env:
+        raw_m = modes_env
+    else:
+        info("  Payment modes (comma-separated) seed the Payment Mode dropdown.")
+        info("  Default: " + ", ".join(default_modes))
+        try:
+            raw_m = input("  Payment modes [Enter for default]: ").strip()
+        except EOFError:
+            raw_m = ""
+    raw_modes = [c.strip() for c in raw_m.split(",") if c.strip()] if raw_m else list(default_modes)
+    _seen_m, payment_modes = set(), []
+    for c in raw_modes:
+        if c.lower() == "unknown" or c.lower() in _seen_m:
+            continue
+        _seen_m.add(c.lower())
+        payment_modes.append(c)
+    payment_modes.append("Unknown")           # always keep the catch-all the code relies on
+    ok("Payment modes: " + ", ".join(payment_modes))
+
     try:
-        ids = provision_notion(parent)
+        ids = provision_notion(parent, categories, payment_modes)
     except Exception as e:
         die("Notion provisioning failed: %s" % e)
     ok("Notion schema provisioned - database ids saved to %s (no secrets in it)" % os.path.basename(STATE_FILE))

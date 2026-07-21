@@ -98,7 +98,7 @@ Notes: the script copies the Apps Script loader to your clipboard automatically 
 
 | Database | Role |
 |---|---|
-| **Expenses** | The ledger — one row per transaction. `Amount` is *your share*; `Total Amount` is the full bill. `Settlement Status` tells you if it's settled, parked (`Needs mapping`), or Notion-only. |
+| **Expenses** | The ledger — one row per transaction. `Amount` is *your share*; `Total Amount` is the full bill. `Group` links to the source Splitwise group (shows its name; empty for direct/non-group expenses). `Settlement Status` tells you if it's settled, parked (`Needs mapping`), or Notion-only. |
 | **People** | Everyone you actually split with: identity (→ Splitwise Users), aliases, live net balance, optional default group, `Merge Into`. |
 | **Groups** | Your Splitwise groups. `Allowed` is the import switch; `Backfilled` marks the one-time history pull. |
 | **Splitwise Users** | Your Splitwise address book (friends + all group members), poller-maintained. Read-only — it's the pick-list behind `Splitwise Identity`. |

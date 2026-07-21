@@ -218,7 +218,7 @@
     </ol>
     <div class="progress">
       <span class="bar" aria-hidden="true"><i></i></span>
-      <span class="count">0 of 12 views built</span>
+      <span class="count">0 of 13 views built</span>
     </div>
     <p class="hint">Tick <strong>Built</strong> on a view card as you finish it — progress is saved in this browser.</p>
   </nav>
@@ -316,6 +316,16 @@
           <div style="display:contents"><dt>Show</dt><dd>Description · Sync Action · Sync Status</dd></div>
         </dl>
         <p class="why"><b>Why:</b> confirms a Delete or Re-push you requested is queued; the row clears once the next sync carries it out. If something couldn't be done (say, Splitwise rejected a delete), <code>Sync Status</code> says so and the action retries next sync.</p>
+      </article>
+      <article class="recipe">
+        <header><h4>Uncategorized (Other) expenses</h4><span class="hdr-right"><span class="chip table">Table</span><label class="built"><input type="checkbox" data-view="attn-other"> Built</label></span></header>
+        <dl class="spec">
+          <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
+          <div style="display:contents"><dt>Filter</dt><dd><code>Expense Type</code> is <code>Other</code></dd></div>
+          <div style="display:contents"><dt>Sort</dt><dd><code>Date</code> descending</dd></div>
+          <div style="display:contents"><dt>Show</dt><dd>Description · Group · Total Amount · Expense Type</dd></div>
+        </dl>
+        <p class="why"><b>Why:</b> these landed on the fallback category — the auto-categorizer wasn't confident, or nothing fit. Skim them and pick a better <code>Expense Type</code> inline where one applies; genuinely miscellaneous ones can stay <code>Other</code> (or set <code>Miscellaneous</code>). The row leaves this view as soon as you recategorize it.</p>
       </article>
     </div>
   </section>

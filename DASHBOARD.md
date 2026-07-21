@@ -31,7 +31,7 @@ Create one page (e.g. **🏦 IronBank**) and add sections in this order — atte
 5. 🧩 **How to resolve things** (the cheatsheet from §6, pasted as text)
 6. 🗄 **System** (the raw databases, in toggles)
 
-## 2. ⚠️ Needs Your Attention — three linked views
+## 2. ⚠️ Needs Your Attention — four linked views
 
 **Expenses to map** — `Table` on **Expenses**
 - Filter: `Settlement Status` **is** `Needs mapping`
@@ -48,6 +48,12 @@ Create one page (e.g. **🏦 IronBank**) and add sections in this order — atte
 - Filter: `Sync Action` **is not empty** *and* `Sync Action` **is not** `None`
 - Show: Description · Sync Action · Sync Status
 - *Why:* confirms a Delete/Re-push you requested is queued; rows clear once the sync carries them out. `Sync Status` explains anything that couldn't be done.
+
+**Uncategorized (Other) expenses** — `Table` on **Expenses**
+- Filter: `Expense Type` **is** `Other`
+- Sort: `Date` descending
+- Show: Description · Group · Total Amount · Expense Type
+- *Why:* these landed on the fallback category — the auto-categorizer wasn't confident, or nothing fit. Skim them and pick a better `Expense Type` inline where one applies; genuinely miscellaneous ones can stay `Other` (or set `Miscellaneous`). The row leaves this view as soon as you recategorize it.
 
 ## 3. 💰 Balances
 

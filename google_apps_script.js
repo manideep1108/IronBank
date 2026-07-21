@@ -2388,6 +2388,54 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
 // answer is a real category get their "Other" default PATCHed. Anything not finished (time budget,
 // Gemini outage) is persisted to a Script Property queue and retried next run, so a big backfill
 // still ends up fully categorized. Failure never blocks the sync — rows simply stay "Other".
+// Populate the Expenses "Group" relation from the "Splitwise Group ID" text so each expense shows
+// its source group by name (and is filterable by group). Backward-compatible: no-op if the property
+// doesn't exist. Only rows with a real group id and no link yet are touched — normally just this
+// run's imports; direct (non-group, id "0") expenses are excluded by the filter and never re-scanned.
+function pollLinkExpenseGroups_(cfg) {
+  var edb;
+  try { edb = pollNotion_(cfg, "GET", "databases/" + cfg.db.expenses); } catch (e) { return 0; }
+  if (!edb.properties || !edb.properties["Group"] || edb.properties["Group"].type !== "relation") return 0;
+
+  var gid2page = {}, gc = null;
+  do {
+    var gb = { page_size: 100 }; if (gc) gb.start_cursor = gc;
+    var gr = pollNotion_(cfg, "POST", "databases/" + cfg.db.groups + "/query", gb);
+    for (var i = 0; i < gr.results.length; i++) {
+      var gp = gr.results[i].properties["Splitwise Group ID"];
+      if (gp && typeof gp.number === "number") gid2page[gp.number] = gr.results[i].id;
+    }
+    gc = gr.has_more ? gr.next_cursor : null;
+  } while (gc);
+
+  // Collect matching pages first (don't mutate mid-pagination).
+  var todo = [], cursor = null;
+  do {
+    var body = { page_size: 100, filter: { and: [
+      { property: "Group", relation: { is_empty: true } },
+      { property: "Splitwise Group ID", rich_text: { is_not_empty: true } },
+      { property: "Splitwise Group ID", rich_text: { does_not_equal: "0" } }
+    ] } };
+    if (cursor) body.start_cursor = cursor;
+    var r = pollNotion_(cfg, "POST", "databases/" + cfg.db.expenses + "/query", body);
+    for (var j = 0; j < r.results.length; j++) todo.push(r.results[j]);
+    cursor = r.has_more ? r.next_cursor : null;
+  } while (cursor);
+
+  var linked = 0;
+  for (var t = 0; t < todo.length; t++) {
+    var gids = pollRichText_(todo[t].properties["Splitwise Group ID"]).split(",");
+    var rel = [];
+    for (var k = 0; k < gids.length; k++) {
+      var gs = gids[k].replace(/^\s+|\s+$/g, "");
+      var page = gs && gs !== "0" ? gid2page[parseInt(gs, 10)] : null;
+      if (page) rel.push({ id: page });
+    }
+    if (rel.length) { pollNotion_(cfg, "PATCH", "pages/" + todo[t].id, { properties: { "Group": { relation: rel } } }); linked++; }
+  }
+  return linked;
+}
+
 function pollCategorizeImports_(cfg, pollStart) {
   var props = PropertiesService.getScriptProperties();
   var pending = [];
@@ -2836,6 +2884,10 @@ function pollSplitwise(opts) {
     var categorized = 0;
     try { categorized = pollCategorizeImports_(cfg, pollStart); }
     catch (ecat) { logToSheet("pollCategorizeImports_ err: " + ecat); }
+
+    // Link each expense to its source Group (relation → the group's name), from the group id text.
+    // Backward-compatible: no-op if the "Group" relation property doesn't exist on the Expenses DB.
+    try { pollLinkExpenseGroups_(cfg); } catch (elg) { logToSheet("pollLinkExpenseGroups_ err: " + elg); }
 
     // Outward passes (cheap when nothing is flagged; skipped when over budget — next run catches up).
     var retried = 0, sa = { del: 0, rep: 0 };
