@@ -495,6 +495,16 @@
         <li>From Notion: set <code>Sync Action</code> to <code>Delete</code> (removes it everywhere) or <code>Re-push</code> (rebuilds the Splitwise side — the replacement is created <em>before</em> the old one is deleted, so a failed re-push destroys nothing). The next sync carries it out and writes the outcome to <code>Sync Status</code>.</li>
       </ol>
     </div>
+
+    <div class="workflow">
+      <h4>A composite expense's total dropped</h4>
+      <p class="trigger">When: one expense split across several Splitwise groups (e.g. 3 people in one group, 1 in another) had a part edited or deleted on Splitwise.</p>
+      <ol class="steps">
+        <li><code>Sync Status</code> shows a <code>⚠️ Total dropped ₹X → ₹Y</code> note naming who was removed. Deleting or reducing part of a multi-group split doesn't move that money anywhere — it just stops being tracked.</li>
+        <li>Check whether it was already settled outside Splitwise (cash, direct transfer). If not, that amount is genuinely no longer owed to you anywhere and needs a manual fix — recreate the expense, or add the missing share elsewhere.</li>
+        <li>No flag means the total held steady — someone was removed from a group's split and the rest absorbed their share automatically, which needs no action from you.</li>
+      </ol>
+    </div>
   </section>
 
   <section id="s09">

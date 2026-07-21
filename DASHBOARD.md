@@ -123,6 +123,10 @@ All grouped tables with **Sum on `Amount`**. `Amount` is **your share** (what *y
 - Fastest: tap **🗑️ Delete** on the bot's reply — removes it from Splitwise *and* Notion (and tells you if anything failed).
 - From Notion: set `Sync Action` to `Delete` (removes everywhere) or `Re-push` (rebuilds the Splitwise side — the new expense is created *before* the old is removed, so nothing is lost if it fails). The next sync executes it and writes the outcome to `Sync Status`.
 
+**A composite expense's total dropped** (one expense split across several Splitwise groups — e.g. 3 people in one group, 1 in another — and one part got edited or deleted on Splitwise)
+- `Sync Status` shows a `⚠️ Total dropped ₹X → ₹Y` note naming who was removed. Deleting or reducing part of a multi-group split doesn't move that money anywhere — it just stops being tracked. Check whether it was already settled outside Splitwise (cash, direct transfer); if not, that amount is genuinely no longer owed to you anywhere and needs a manual fix (recreate the expense, or add the missing share elsewhere).
+- No flag means the total held steady — someone was removed from a group's split and the rest absorbed their share automatically, which needs no action from you.
+
 ## 7. Settlement Status reference
 
 | Status | Meaning | Act? |

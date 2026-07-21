@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.4.0";
+var IRONBANK_VERSION = "1.4.1";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -2396,6 +2396,21 @@ function pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, p
   };
 }
 
+// §20b — if a composite row's Total Amount just shrank (a sub-expense was deleted, or its cost was
+// edited down), flag it in Sync Status instead of letting it vanish silently. Deleting/reducing a
+// sub-expense doesn't move that money anywhere — someone may still genuinely be owed it, unless it
+// was already settled outside Splitwise. Only fires on a real drop; a same-cost redistribution among
+// fewer people (someone removed from an equal split, the rest absorb it) keeps the total unchanged
+// and is left alone.
+function pollFlagCompositeDrop_(props, oldTotal, droppedNames) {
+  var newTotal = props["Total Amount"].number;
+  if (newTotal >= oldTotal - 0.5) return;
+  var msg = "⚠️ Total dropped ₹" + oldTotal.toFixed(2) + " → ₹" + newTotal.toFixed(2) +
+    (droppedNames && droppedNames.length ? " (" + droppedNames.join(", ") + ")" : "") +
+    ". Verify this was settled outside Splitwise, or add the missing share elsewhere.";
+  props["Sync Status"] = { rich_text: rtChunks_(msg) };
+}
+
 // Upsert one Splitwise expense into Notion. Returns "create" | "update" | "archive" | "skip".
 function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCache, token, ownerName) {
   var swid = e.id;
@@ -2423,6 +2438,13 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
       if (!keepIds.length) { pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { archived: true }); return "archive"; }
       var rebuiltD = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, keepIds);
       if (!rebuiltD.liveSwids.length) { pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { archived: true }); return "archive"; }
+      var oldTotalD = (dpage.properties["Total Amount"] && dpage.properties["Total Amount"].number) || 0;
+      var droppedNamesD = [], eusersD = e.users || [];
+      for (var wd = 0; wd < eusersD.length; wd++) {
+        var wu = eusersD[wd], wuid = wu.user_id || (wu.user && wu.user.id), wowed = parseFloat(wu.owed_share || 0);
+        if (wuid !== ownerId && wowed > 0) droppedNamesD.push((idToName[wuid] || ("User " + wuid)) + ": ₹" + wowed.toFixed(2));
+      }
+      pollFlagCompositeDrop_(rebuiltD.props, oldTotalD, droppedNamesD);
       pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { properties: rebuiltD.props });
       return "update";
     }
@@ -2453,6 +2475,8 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
     if (existingIdsClean.length > 1) {
       var rebuiltU = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, existingIdsClean);
       if (!rebuiltU.liveSwids.length) { pollNotion_(cfg, "PATCH", "pages/" + page.id, { archived: true }); return "archive"; }
+      var oldTotalU = (page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0;
+      pollFlagCompositeDrop_(rebuiltU.props, oldTotalU, null);
       pollNotion_(cfg, "PATCH", "pages/" + page.id, { properties: rebuiltU.props });
       return "update";
     }
