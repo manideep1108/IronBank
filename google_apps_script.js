@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.3.1";
+var IRONBANK_VERSION = "1.4.0";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -2336,6 +2336,66 @@ function pollFindExpense_(cfg, swid) {
   return null;
 }
 
+// §20 — rebuild a composite row's descriptive fields (Total Amount, Amount, Participants, Splits
+// Summary, Splits Data) from the CURRENT live state of every one of its remaining Splitwise
+// sub-expenses. A composite row (one Notion expense -> several Splitwise sub-expenses, from our own
+// multi-group push) previously went stale the moment any ONE sub-expense changed: an edit to one
+// sub-expense's participants was silently skipped entirely, and deleting one sub-expense only
+// trimmed the Splitwise ID list while Total Amount/Participants/Splits Data kept describing people
+// and amounts no longer live on Splitwise. This re-derives everything from each remaining
+// sub-expense's actual owed_share values — never assumes an equal split, since Splitwise may have
+// redistributed unevenly or the user may have set custom uneven shares — so both cases come out
+// correct. Returns { props, liveSwids }; liveSwids drops any id that turned out already-deleted or
+// unreachable during the rebuild (a race between the trigger and this call).
+function pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, swids) {
+  var totalCost = 0, ownerShare = 0, latestUpdatedAt = "";
+  var summaryParts = [], participantIds = [], splitsData = [], pseen = {};
+  var liveSwids = [], liveGids = [];
+  for (var i = 0; i < swids.length; i++) {
+    var sid = swids[i];
+    var exp;
+    try { exp = swGet_(token, "get_expense/" + sid).expense; } catch (ge) { continue; }  // vanished/unreachable — drop it, don't fail the whole rebuild
+    if (!exp || exp.deleted_at) continue;   // race: deleted between the trigger and this rebuild
+    liveSwids.push(String(sid));
+    liveGids.push(String(exp.group_id || 0));
+    totalCost += parseFloat(exp.cost || 0);
+    if ((exp.updated_at || "") > latestUpdatedAt) latestUpdatedAt = exp.updated_at || "";
+    var eusers = exp.users || [];
+    for (var j = 0; j < eusers.length; j++) {
+      var uu = eusers[j];
+      var uid = uu.user_id || (uu.user && uu.user.id);
+      if (uid === ownerId) ownerShare += parseFloat(uu.owed_share || 0);
+    }
+    // Same owed>0 filter as the single-expense path — the owner is included too if this particular
+    // sub-expense genuinely assigns them a share (rare for our own pushes, which always zero it, but
+    // possible if someone hand-edits the sub-expense on Splitwise afterward).
+    for (var s = 0; s < eusers.length; s++) {
+      var su = eusers[s];
+      var suid = su.user_id || (su.user && su.user.id);
+      var owed = parseFloat(su.owed_share || 0);
+      if (owed <= 0) continue;
+      var pname = idToName[suid] || ("User " + suid);
+      var ppage = pollUpsertPerson_(cfg, { id: suid }, ownerId, ownerName, idToName, personCache);
+      if (ppage && !pseen[ppage]) { participantIds.push({ id: ppage }); pseen[ppage] = true; }
+      summaryParts.push(pname + ": ₹" + owed.toFixed(2));
+      splitsData.push({ person: pname, owed: Math.round(owed * 100) / 100 });
+    }
+  }
+  return {
+    liveSwids: liveSwids,
+    props: {
+      "Amount": { number: Math.round(ownerShare * 100) / 100 },
+      "Total Amount": { number: Math.round(totalCost * 100) / 100 },
+      "Participants": { relation: participantIds },
+      "Splits Summary": { rich_text: rtChunks_(summaryParts.join(", ")) },
+      "Splits Data": { rich_text: rtChunks_(JSON.stringify(splitsData)) },
+      "Splitwise ID": { rich_text: [{ text: { content: liveSwids.join(",") } }] },
+      "Splitwise Group ID": { rich_text: [{ text: { content: liveGids.join(",") } }] },
+      "Splitwise Updated At": { rich_text: [{ text: { content: latestUpdatedAt } }] }
+    }
+  };
+}
+
 // Upsert one Splitwise expense into Notion. Returns "create" | "update" | "archive" | "skip".
 function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCache, token, ownerName) {
   var swid = e.id;
@@ -2353,20 +2413,17 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
     var idList = [];
     for (var di = 0; di < idListRaw.length; di++) { var dt = idListRaw[di].replace(/^\s+|\s+$/g, ""); if (dt) idList.push(dt); }
     if (idList.length > 1) {
-      // Composite row (one Notion expense → several Splitwise expenses): drop only this id and
-      // its group id — the row lives on for its remaining Splitwise expenses. Archiving the
-      // whole row here would orphan the still-live expenses and resurrect them as fragments.
-      var gidListRaw = pollRichText_(dpage.properties["Splitwise Group ID"]).split(",");
-      var keepIds = [], keepGids = [];
-      for (var ki = 0; ki < idList.length; ki++) {
-        if (idList[ki] === String(swid)) continue;
-        keepIds.push(idList[ki]);
-        if (gidListRaw[ki] != null) keepGids.push(gidListRaw[ki].replace(/^\s+|\s+$/g, ""));
-      }
-      pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { properties: {
-        "Splitwise ID": { rich_text: [{ text: { content: keepIds.join(",") } }] },
-        "Splitwise Group ID": { rich_text: [{ text: { content: keepGids.join(",") } }] }
-      } });
+      // §20 — Composite row (one Notion expense → several Splitwise expenses): re-derive
+      // Total Amount/Amount/Participants/Splits Data/Splits Summary from the REMAINING live
+      // sub-expenses' actual owed_share values, rather than only trimming the id list — the row
+      // no longer describes the just-deleted person's share once this returns. Archiving the whole
+      // row here would still orphan the still-live expenses, so it only happens if none remain live.
+      var keepIds = [];
+      for (var ki = 0; ki < idList.length; ki++) if (idList[ki] !== String(swid)) keepIds.push(idList[ki]);
+      if (!keepIds.length) { pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { archived: true }); return "archive"; }
+      var rebuiltD = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, keepIds);
+      if (!rebuiltD.liveSwids.length) { pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { archived: true }); return "archive"; }
+      pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { properties: rebuiltD.props });
       return "update";
     }
     pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { archived: true });
@@ -2384,9 +2441,22 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
     for (var dupRetry = 0; dupRetry < 3 && !page; dupRetry++) { Utilities.sleep(400); page = pollFindExpense_(cfg, swid); }
   }
   if (page && pollRichText_(page.properties["Splitwise Updated At"]) === (e.updated_at || "")) return "skip";
-  // §13b composite guard: a row whose Splitwise ID is a list (owner-created across multiple groups)
-  // must not be clobbered by one group-expense's inbound data. Leave composite rows to the owner side.
-  if (page && pollRichText_(page.properties["Splitwise ID"]).indexOf(",") >= 0) return "skip";
+  // §13b/§20 composite guard: a row whose Splitwise ID is a list (owner-created across multiple
+  // groups) must not be clobbered by writing just THIS one sub-expense's data over the whole row.
+  // Instead rebuild every field from the CURRENT live state of all the row's sub-expenses — this is
+  // what makes a participant being added/removed/redistributed within one sub-expense (equally or
+  // unevenly) actually show up in Notion instead of being silently ignored.
+  if (page) {
+    var existingIdsRaw = pollRichText_(page.properties["Splitwise ID"]).split(",");
+    var existingIdsClean = [];
+    for (var eic = 0; eic < existingIdsRaw.length; eic++) { var eit = existingIdsRaw[eic].replace(/^\s+|\s+$/g, ""); if (eit) existingIdsClean.push(eit); }
+    if (existingIdsClean.length > 1) {
+      var rebuiltU = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, existingIdsClean);
+      if (!rebuiltU.liveSwids.length) { pollNotion_(cfg, "PATCH", "pages/" + page.id, { archived: true }); return "archive"; }
+      pollNotion_(cfg, "PATCH", "pages/" + page.id, { properties: rebuiltU.props });
+      return "update";
+    }
+  }
 
   var cost = parseFloat(e.cost || 0);
   var payerId = null, ownerShare = 0;
