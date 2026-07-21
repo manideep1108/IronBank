@@ -312,10 +312,10 @@
         <header><h4>Pending sync actions</h4><span class="hdr-right"><span class="chip table">Table</span><label class="built"><input type="checkbox" data-view="attn-pending-sync"> Built</label></span></header>
         <dl class="spec">
           <div style="display:contents"><dt>Source&nbsp;DB</dt><dd>Expenses</dd></div>
-          <div style="display:contents"><dt>Filter</dt><dd><code>Sync Action</code> is not empty <em>and</em> is not <code>None</code></dd></div>
+          <div style="display:contents"><dt>Filter</dt><dd>OR group: (<code>Sync Action</code> is not empty <em>and</em> is not <code>None</code>) <em>or</em> <code>Sync Status</code> is not empty</dd></div>
           <div style="display:contents"><dt>Show</dt><dd>Description · Sync Action · Sync Status</dd></div>
         </dl>
-        <p class="why"><b>Why:</b> confirms a Delete or Re-push you requested is queued; the row clears once the next sync carries it out. If something couldn't be done (say, Splitwise rejected a delete), <code>Sync Status</code> says so and the action retries next sync.</p>
+        <p class="why"><b>Why:</b> confirms a Delete or Re-push you requested is queued, <em>and</em> surfaces passive warnings the sync writes on its own — like a composite expense's total dropping or a duplicate-mapping notice — even when no <code>Sync Action</code> was set. If something couldn't be done (say, Splitwise rejected a delete), <code>Sync Status</code> says so and the action retries next sync.</p>
       </article>
       <article class="recipe">
         <header><h4>Uncategorized (Other) expenses</h4><span class="hdr-right"><span class="chip table">Table</span><label class="built"><input type="checkbox" data-view="attn-other"> Built</label></span></header>

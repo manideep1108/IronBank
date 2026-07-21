@@ -45,9 +45,9 @@ Create one page (e.g. **🏦 IronBank**) and add sections in this order — atte
 - *Why:* a person can't settle until they have an identity. The **Candidates** column carries poller-suggested matches — usually the right one is already listed; pick it in the `Splitwise Identity` dropdown right here.
 
 **Pending sync actions** — `Table` on **Expenses**
-- Filter: `Sync Action` **is not empty** *and* `Sync Action` **is not** `None`
+- Filter (OR group): (`Sync Action` **is not empty** *and* `Sync Action` **is not** `None`) **OR** `Sync Status` **is not empty**
 - Show: Description · Sync Action · Sync Status
-- *Why:* confirms a Delete/Re-push you requested is queued; rows clear once the sync carries them out. `Sync Status` explains anything that couldn't be done.
+- *Why:* confirms a Delete/Re-push you requested is queued, *and* surfaces passive warnings the sync writes on its own — like a composite expense's total dropping (§8) or a duplicate-mapping notice. Rows clear once the sync carries the action out, or once you resolve the flag and it's no longer true.
 
 **Uncategorized (Other) expenses** — `Table` on **Expenses**
 - Filter: `Expense Type` **is** `Other`
