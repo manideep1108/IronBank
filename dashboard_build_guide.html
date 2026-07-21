@@ -457,12 +457,23 @@
     </div>
 
     <div class="workflow">
-      <h4>Merge a nickname or duplicate</h4>
-      <p class="trigger">When: the bot created a stray person (e.g. "Mang") that's really someone you already have (Mangalik).</p>
+      <h4>Merge a nickname / stray</h4>
+      <p class="trigger">When: the bot created a stray person (e.g. "Mang") <strong>with no Splitwise Identity</strong> that's really someone you already have (Mangalik).</p>
       <ol class="steps">
         <li>Open the <strong>stray</strong> person's row.</li>
         <li>Set <code>Merge Into</code> to the real person.</li>
         <li>The next sync folds them together: it saves the stray name as an alias, re-points every expense to the real person, and archives the stray. Future messages using that nickname resolve on their own.</li>
+      </ol>
+    </div>
+
+    <div class="workflow">
+      <h4>One person with two Splitwise accounts</h4>
+      <p class="trigger">When: the same human has two real Splitwise IDs (e.g. an old and a new registration) and you don't want expenses landing on the wrong one.</p>
+      <ol class="steps">
+        <li><strong>Don't</strong> use <code>Merge Into</code> — archiving a live account is pointless, the sync just re-imports it from your friends / allowed groups.</li>
+        <li>Keep <strong>both</strong> People rows; give the duplicate a <strong>distinct name</strong>.</li>
+        <li>On the duplicate, set <code>Primary Identity</code> to the <strong>primary account's Splitwise User ID</strong> (copy it from the primary row).</li>
+        <li>Now everything you <em>log</em> routes to the primary, the duplicate is no longer offered as a name match, and it still imports its own expenses. To retire the duplicate entirely, remove that account from your Splitwise friends and shared groups.</li>
       </ol>
     </div>
 

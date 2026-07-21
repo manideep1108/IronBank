@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.2.0";
+var IRONBANK_VERSION = "1.3.0";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -1105,7 +1105,11 @@ function fetchPeople_(cfg) {
         name: pollRichText_(pp["Name"]),
         aliases: pollRichText_(pp["Aliases"]),
         swid: (pp["Splitwise User ID"] && pp["Splitwise User ID"].number) || null,
-        defaultGroupPageId: dg.length ? dg[0].id : null
+        defaultGroupPageId: dg.length ? dg[0].id : null,
+        // §18 — Secondary Identity: when a person has TWO Splitwise accounts, the duplicate row
+        // carries the PRIMARY account's Splitwise ID here. Directional by construction (only the
+        // secondary sets it), keyed by stable swid — no self-relation symmetry. Absent/blank ⇒ null.
+        primaryIdentity: (pp["Primary Identity"] && typeof pp["Primary Identity"].number === "number") ? pp["Primary Identity"].number : null
       });
     }
     cursor = r.has_more ? r.next_cursor : null;
@@ -1123,6 +1127,9 @@ function getPeopleRosterForAI(cfg, ownerName, peopleRows) {
   for (var i = 0; i < rows.length; i++) {
     var nm = rows[i].name;
     if (!nm) continue;
+    // §18 — a Secondary Identity's person is already represented by its primary row; don't surface
+    // the duplicate name to the AI (keeps Gemini from ever normalising to the dup account).
+    if (rows[i].primaryIdentity != null) continue;
     var key = nm.toLowerCase().replace(/^\s+|\s+$/g, "");
     if (seen[key]) continue;
     seen[key] = true;
@@ -1535,10 +1542,25 @@ function resolvePushPlanForParticipants_(cfg, parsed, ownerName, peopleRows) {
   // People routing: name+alias(lower) -> {swid, gid, name}. Readiness ⇔ has a Splitwise User ID;
   // an Allowed Default Group routes into that group, otherwise the direct (non-group) bucket.
   var rows = peopleRows || fetchPeople_(cfg);
+  // §18 — each real identity's own routing entry keyed by Splitwise ID. A Secondary Identity
+  // (Primary Identity set) redirects its OUTBOUND shares to that primary, so bot-created expenses
+  // never hit a duplicate account. Non-destructive: the secondary row still imports its own
+  // Splitwise expenses; only the push direction is redirected.
+  var ownEntryBySwid = {};
+  for (var oe = 0; oe < rows.length; oe++) {
+    if (rows[oe].swid == null) continue;
+    var oginfo = rows[oe].defaultGroupPageId ? groupsByPage[rows[oe].defaultGroupPageId] : null;
+    ownEntryBySwid[rows[oe].swid] = { swid: rows[oe].swid, gid: (oginfo && oginfo.allowed) ? oginfo.gid : null, name: rows[oe].name };
+  }
   var routing = {}, collidingKey = {};
   for (var p = 0; p < rows.length; p++) {
     var ginfo = rows[p].defaultGroupPageId ? groupsByPage[rows[p].defaultGroupPageId] : null;
     var entry = { swid: rows[p].swid, gid: (ginfo && ginfo.allowed) ? ginfo.gid : null, name: rows[p].name };
+    // §18 — redirect a secondary identity to its primary (single hop; self-pointer or an unimported
+    // primary falls through to the row's own entry, so we never lose the participant).
+    if (rows[p].primaryIdentity != null && rows[p].primaryIdentity !== rows[p].swid && ownEntryBySwid[rows[p].primaryIdentity]) {
+      entry = ownEntryBySwid[rows[p].primaryIdentity];
+    }
     var keys = [rows[p].name];
     if (rows[p].aliases) { var av = rows[p].aliases.split(","); for (var ai = 0; ai < av.length; ai++) keys.push(av[ai]); }
     for (var ki = 0; ki < keys.length; ki++) {
@@ -2034,6 +2056,25 @@ function pollLinkPeopleIdentity_(cfg) {
   }
 }
 
+// §18 — Merge Into is a self-referential relation, and Notion MIRRORS such relations onto both rows:
+// setting A→B silently adds B→A. So a merge pair surfaces twice, and "which row gets archived" would
+// otherwise depend on query order — risking archiving the canonical person. This picks the row to
+// archive deterministically. Returns true iff `rowPage` is the stray to fold into `targetPage`.
+function mergeStrayIsRow_(rowPage, targetPage) {
+  var rSwid = rowPage.properties["Splitwise User ID"] && rowPage.properties["Splitwise User ID"].number;
+  var tRel = (targetPage && targetPage.properties["Merge Into"] && targetPage.properties["Merge Into"].relation) || [];
+  var mutual = false;
+  for (var i = 0; i < tRel.length; i++) if (tRel[i].id === rowPage.id) { mutual = true; break; }
+  if (!mutual) return true;   // one-way link (legacy / non-mirrored): archive the row as flagged
+  var tSwid = targetPage.properties["Splitwise User ID"] && targetPage.properties["Splitwise User ID"].number;
+  // Mutual pair — decide the survivor:
+  if (rSwid != null && tSwid != null) return false;   // TWO real Splitwise identities → never archive
+                                                       // either (use the Primary Identity field instead)
+  if (rSwid == null && tSwid != null) return true;    // row is a swid-less placeholder → fold it in
+  if (rSwid != null && tSwid == null) return false;   // row is the real person → the placeholder side archives
+  return String(rowPage.created_time || "") > String(targetPage.created_time || ""); // neither swid → newer folds in
+}
+
 // §17 — process Merge Into: fold a stray person into the target (aliases + repoint expenses + archive).
 function pollProcessMerges_(cfg) {
   var idName = pollPeopleIdName_(cfg), cursor = null, merged = 0;
@@ -2048,16 +2089,22 @@ function pollProcessMerges_(cfg) {
       // Follow chains (A→B while B→C is flagged in the same run): merge A straight into the
       // final target, or PATCHing an already-archived intermediate would 400. Cycle-guarded.
       var seenIds = {}; seenIds[row.id] = true;
+      var tpage = null;
       for (var hop = 0; hop < 5; hop++) {
         if (seenIds[targetId]) break;
         seenIds[targetId] = true;
-        var tpage;
-        try { tpage = pollNotion_(cfg, "GET", "pages/" + targetId, null); } catch (tpe) { break; }
+        try { tpage = pollNotion_(cfg, "GET", "pages/" + targetId, null); } catch (tpe) { tpage = null; break; }
         var trel = (tpage.properties["Merge Into"] && tpage.properties["Merge Into"].relation) || [];
         if (!trel.length || trel[0].id === targetId || seenIds[trel[0].id]) break;
-        targetId = trel[0].id;
+        targetId = trel[0].id; tpage = null;   // advanced past this hop; re-fetch the new target
       }
       if (targetId === row.id) continue;   // chain looped back to the stray itself
+      if (!tpage) { try { tpage = pollNotion_(cfg, "GET", "pages/" + targetId, null); } catch (tpe2) { tpage = null; } }
+      // §18 — deterministic survivor selection (Notion mirrors the self-relation onto both rows).
+      if (!mergeStrayIsRow_(row, tpage)) {
+        logToSheet("§17 merge: skipped '" + strayName + "' — mutual pair; not archiving this side (set Primary Identity if these are two Splitwise accounts of one person)");
+        continue;
+      }
       var strayAliases = pollRichText_(row.properties["Aliases"]);
       mergeStrayPerson_(cfg, row.id, targetId, idName[targetId] || "", strayName);
       if (strayAliases) { var av = strayAliases.split(","); for (var a = 0; a < av.length; a++) { var al = av[a].replace(/^\s+|\s+$/g, ""); if (al) saveAlias_(cfg, targetId, al); } }

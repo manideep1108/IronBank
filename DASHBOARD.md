@@ -107,9 +107,14 @@ All grouped tables with **Sum on `Amount`**. `Amount` is **your share** (what *y
 3. *Optional:* set a `Default Group` to route their expenses into a specific Splitwise group. **Leave it empty** and they settle as direct friend expenses.
 4. Done — parked expenses with them push automatically on the next sync (`/sync` to hurry it).
 
-**Merge a nickname or duplicate** (the bot created "Mang" but that's really Mangalik)
-1. Open the **stray** row in People → set `Merge Into` to the real person.
+**Merge a nickname/stray** (the bot created "Mang" but that's really Mangalik)
+1. Open the **stray** row in People → set `Merge Into` to the real person. Use this only for a stray that has **no Splitwise Identity** — a placeholder the bot made for a nickname it couldn't match.
 2. The next sync saves the stray name as an alias, re-points every expense, archives the stray. That nickname resolves silently forever after.
+
+**One person with two Splitwise accounts** (same human, two real Splitwise IDs — e.g. an old and a new registration)
+- **Don't** use `Merge Into` here — archiving a live Splitwise account is pointless, because the sync just re-imports it from your friends/allowed groups on the next run.
+- Instead: keep **both** People rows, give the duplicate a **distinct name**, and set the duplicate's `Primary Identity` to the **primary account's Splitwise User ID** (copy it from the primary row's `Splitwise User ID`).
+- From then on, every expense you *log* routes to the primary account, the duplicate stops being offered as a name match, and it still faithfully imports any expenses that land on it directly. To retire the duplicate for good, remove that account from your Splitwise friends and shared groups.
 
 **Answer an ambiguous name** ("Adi" → Aditya or Aditi?)
 - The bot asks right in Telegram with buttons — tap the right person. The nickname is saved; it's never asked again. Nothing to do in Notion. (If the buttons expired: the expense **is** logged — fix via `Merge Into`, don't re-send.)

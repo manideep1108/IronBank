@@ -11,5 +11,10 @@ config*.json
 *.log
 __pycache__/
 
+# personal financial data — never commit (names, amounts, backfill working files)
+ManiTracker.xlsx
+backfill_plan.csv
+backfill_expenses_staged.csv
+
 # local Claude Code tooling
 .claude/
