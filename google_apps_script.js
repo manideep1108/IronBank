@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.4.2";
+var IRONBANK_VERSION = "1.4.3";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -1231,10 +1231,21 @@ function resolveNames_(cfg, parsed, ownerName, peopleRows) {
   for (var nm in names) {
     var low = normName_(nm);
     if (NOTION_OWNER_ALIASES[low] === 1 || low === ownerLower) { out.map[nm] = ownerName; continue; }
+    var v = verdicts[low];
+    // §14.11 — check what the user ACTUALLY TYPED (v.typed) against the People index before trusting
+    // Gemini's own canonicalization (`nm`). Gemini can confidently output the WRONG existing roster name
+    // (e.g. "kuthar" -> "Ayush Kothari" instead of the exact alias match "Aditya Kuthar") — if we only
+    // ever look up Gemini's own guess, a wrong-but-real name silently passes as an "exact match" and the
+    // deterministic index never gets a chance to catch it against the raw text.
+    var typedLow = (v && v.typed) ? normName_(v.typed) : null;
+    if (typedLow && typedLow !== low) {
+      var thits = idx.byKey[typedLow] || [];
+      if (thits.length === 1) { out.map[nm] = thits[0].canonical; continue; }              // tier-1.5 exact on raw typed text
+      if (thits.length > 1) { out.ambiguous.push({ typed: nm, candidates: candList_(thits) }); continue; }
+    }
     var hits = idx.byKey[low] || [];
     if (hits.length === 1) { out.map[nm] = hits[0].canonical; continue; }                 // tier-2 exact
     if (hits.length > 1) { out.ambiguous.push({ typed: nm, candidates: candList_(hits) }); continue; }  // alias claimed by many
-    var v = verdicts[low];
     if (v && v.status === "resolved" && v.canonical) {                                     // tier-3 Gemini fuzzy
       var ch = idx.byKey[normName_(v.canonical)] || [];
       if (ch.length === 1) { out.map[nm] = ch[0].canonical; continue; }
