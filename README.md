@@ -38,7 +38,7 @@ SETTLE     Splitwise — native settlement + authoritative balances
 
 ## Setup (~20 minutes, once)
 
-**Step 0 — start from the Notion template (recommended).** Open the [IronBank Notion template](https://app.notion.com/p/IronBank-Template-3a3f0556bd7e80bfb29fd0c67e04168a?source=copy_link), click **Duplicate** into your own workspace, then share *your copy* with your Notion integration (page ••• menu → Connections). Copy your duplicated page's URL — you'll paste it when the script asks for your Notion parent page. The 4 databases and the dashboard views come pre-built, empty, and ready to go; the script detects them by name and reuses them instead of creating new ones.
+**Step 0 — start from the Notion template (recommended).** Open the [IronBank Notion template](https://glitter-rondeletia-5b2.notion.site/IronBank-Template-3a8f0556bd7e8039b77dd625858d6f04?source=copy_link), click **Duplicate** into your own workspace, then share *your copy* with your Notion integration (page ••• menu → Connections). Copy your duplicated page's URL — you'll paste it when the script asks for your Notion parent page. The 4 databases and the dashboard views come pre-built, empty, and ready to go; the script detects them by name and reuses them instead of creating new ones.
 
 Don't want to use the template? Share any blank page instead — the script will create the databases from scratch, and you'll build the dashboard views yourself at the end (see the last row below).
 
