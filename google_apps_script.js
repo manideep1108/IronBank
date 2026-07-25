@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.4.3";
+var IRONBANK_VERSION = "1.5.0";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -54,8 +54,18 @@ function calculateSplits(data) {
   var fixedSplits = data.fixed_splits || [];
   var weightedSplits = data.weighted_splits || [];
   
+  // Solo expense with no split instructions at all ("95 for auto to office", "135 lunch for
+  // myself"). The prompt tells Gemini to put the owner in weighted_splits, but that is an
+  // instruction, not a guarantee — it has come back with BOTH arrays empty, and an empty split list
+  // is silently destructive: writeToNotion derives your share by summing your splits, so the row
+  // lands with Amount ₹0 against a real Total and the expense disappears from /report. The payer
+  // owns the whole amount when nobody else was named.
+  if (!fixedSplits.length && !weightedSplits.length && totalAmount > 0 && data.payer) {
+    return [{ name: data.payer, amount: Math.round(totalAmount * 100) / 100 }];
+  }
+
   var finalSplits = {}; // Map of name -> amount
-  
+
   // 1. Process fixed splits
   var fixedSum = 0;
   for (var i = 0; i < fixedSplits.length; i++) {
@@ -411,9 +421,11 @@ function doPost(e) {
 
     if (action === "updateConfig") {
       var key = update.key || e.parameter.key;
-      var val = update.value || e.parameter.value;
+      // `!= null` rather than `||` — "" and "0" are legitimate values, and falling through to the
+      // undefined branch would store the literal string "undefined" instead of clearing the setting.
+      var val = (update.value != null) ? update.value : e.parameter.value;
       if (key) {
-        saveSetting(key, val);
+        saveSetting(key, val == null ? "" : val);
         if (key === "WEBAPP_URL") setupWebhook(val);   // registering the URL also registers the webhook
         return ContentService.createTextOutput(JSON.stringify({ success: true })).setMimeType(ContentService.MimeType.JSON);
       }
@@ -430,6 +442,257 @@ function doPost(e) {
 // ==========================================
 // NATURAL LANGUAGE PROCESSING VIA GEMINI
 // ==========================================
+// A text message and a receipt photo are the SAME pipeline with two different Gemini inputs.
+// Everything the two paths share lives in the helpers below, deliberately, because they already
+// drifted once: the solo-expense fallback ("no other participant mentioned → the owner takes the
+// whole amount") existed only in the photo prompt, so a text message like "95 for auto to office
+// for myself" came back with both split arrays empty and was recorded with a ₹0 owner share.
+
+// Roster + live Notion dropdowns, fetched once per incoming message.
+function prepareExpenseContext_(ownerName) {
+  var cfg = getNotionConfig();
+  // §14 — feed Gemini the Notion People roster (canonical Name + Aliases) so it normalises
+  // nicknames/typos to canonical names. Fall back to the cached roster if Notion isn't configured
+  // or errors (a roster fetch must never break expense logging).
+  var roster, peopleRows = null;
+  try {
+    if (cfg) {
+      peopleRows = fetchPeople_(cfg);   // one scan powers roster + resolution + routing
+      roster = getPeopleRosterForAI(cfg, ownerName, peopleRows);
+    } else {
+      roster = rosterFallback_(ownerName);
+    }
+  } catch (rosterErr) {
+    logToSheet("roster fetch failed, using last-good cached roster: " + rosterErr);
+    peopleRows = null;
+    roster = rosterFallback_(ownerName);
+  }
+  var allowedPaymentModes = getAllowedPaymentModes(cfg);
+  return {
+    cfg: cfg,
+    peopleRows: peopleRows,
+    roster: roster,
+    today: Utilities.formatDate(new Date(), "GMT+5:30", "yyyy-MM-dd"),
+    allowedPaymentModes: allowedPaymentModes,
+    paymentModeEnum: allowedPaymentModes.concat(["Unknown"]),
+    allowedCategories: getAllowedCategories(cfg)
+  };
+}
+
+// §14 — the identity/roster context block both prompts open with.
+function expensePromptContext_(ctx, ownerName) {
+  return "- Current date: " + ctx.today + "\n" +
+    "- Bot owner name: " + ownerName + " (Map 'I', 'me', 'my', 'myself' to this name)\n" +
+    "- Known people (resolve EACH participant + the payer to one of these canonical names — match nicknames, the aliases shown in parentheses, and obvious typos, e.g. 'Mang'→'Mangalik'. Output the canonical Name, not the typed form. Only keep a name exactly as typed if nobody here plausibly matches): " + ctx.roster.text + "\n" +
+    "  Also output a 'resolutions' array with one entry per DISTINCT name you use (payer + every split name): {name, typed, status, canonical, candidates}. Always set 'typed' to the ORIGINAL token the user literally wrote for that person (e.g. 'Mang'), even when 'name'/'canonical' is the normalized Name. status='resolved' when exactly one Known person matches — set canonical to their exact Name AND use that canonical Name in the splits. status='ambiguous' when 2+ Known people plausibly match (e.g. 'Adi' when both Aditya and Aditi exist) — list them in candidates and keep the name AS TYPED. status='unknown' when nobody Known matches — keep the name AS TYPED. Never guess between two people.\n" +
+    "  Also output 'total_amount_raw' = the total amount exactly as written (including any math expression).\n" +
+    "- Allowed payment modes: " + JSON.stringify(ctx.allowedPaymentModes) + "\n" +
+    "- Allowed categories: " + JSON.stringify(ctx.allowedCategories) + "\n\n";
+}
+
+// The split-instruction rules — IDENTICAL for text and photo, and kept in one place because these
+// are precisely the rules that drifted. The last bullet is the solo-expense fallback: without it
+// Gemini is left to guess what "for myself" means and sometimes answers with no splits at all.
+function expenseSplitRules_(ownerName, no) {
+  return no + ". Deduce split instructions. Instead of calculating split amounts yourself, separate them into:\n" +
+    "   - fixed_splits: People who owe a specific fixed amount (e.g. A had 800).\n" +
+    "   - weighted_splits: People who share the remainder. Give a weight of 1 to each person splitting the remainder equally (e.g. if A, B, C split equally, add each with weight: 1).\n" +
+    "   - If the total amount is split equally among everyone (e.g. A and B split 50-50), leave fixed_splits empty, and put them in weighted_splits with weight 1.\n" +
+    "   - If nobody else is involved — no other participant is named, or the input says 'for myself'/'for me'/'no one else involved' — leave fixed_splits empty and put ONLY the owner '" + ownerName + "' in weighted_splits with weight 1. NEVER return both arrays empty when there is a total amount.\n";
+}
+
+// Per-item lists with mixed groupings — same computation, different source of the items.
+function expensePerItemRule_(ownerName, no, itemsFrom, example) {
+  return no + ". For per-item lists " + itemsFrom + " with mixed or complex split groupings (e.g., '" + example + "'):\n" +
+    "   - Identify all items and their values.\n" +
+    "   - Calculate each person's total share by dividing the cost of each item among its designated split group and summing their shares across all items (map 'I', 'me', 'my', 'myself' to '" + ownerName + "').\n" +
+    "   - Represent all these summed shares in the 'fixed_splits' array (including the owner '" + ownerName + "' if they have a share).\n" +
+    "   - Leave 'weighted_splits' empty in this case.\n";
+}
+
+// The Gemini generationConfig (structured-output schema) both paths post. Only the `description`
+// field's hint differs — a free-text description vs. the merchant name off a receipt.
+function expenseGenerationConfig_(ctx, descriptionHint) {
+  return {
+    "responseMimeType": "application/json",
+    "responseSchema": {
+      "type": "OBJECT",
+      "properties": {
+        "date": { "type": "STRING", "description": "YYYY-MM-DD format" },
+        "description": { "type": "STRING", "description": descriptionHint },
+        "category": { "type": "STRING", "enum": ctx.allowedCategories },
+        "total_amount": { "type": "NUMBER", "description": "The total cost of the transaction. If the description contains a math expression for the amount, evaluate it to a single numeric value." },
+        "payer": { "type": "STRING" },
+        "payment_mode": { "type": "STRING", "enum": ctx.paymentModeEnum, "description": "MUST be one of the allowed payment modes; use 'Unknown' if none is identified" },
+        "fixed_splits": {
+          "type": "ARRAY",
+          "items": {
+            "type": "OBJECT",
+            "properties": {
+              "name": { "type": "STRING" },
+              "amount": { "type": "NUMBER", "description": "Exact fixed amount this person owes. If it is a math expression, evaluate it first to a single numeric value." }
+            },
+            "required": ["name", "amount"]
+          }
+        },
+        "weighted_splits": {
+          "type": "ARRAY",
+          "items": {
+            "type": "OBJECT",
+            "properties": {
+              "name": { "type": "STRING" },
+              "weight": { "type": "NUMBER", "description": "Relative weight share of the remainder (usually 1)" }
+            },
+            "required": ["name", "weight"]
+          }
+        },
+        "total_amount_raw": { "type": "STRING", "description": "The total amount EXACTLY as written in the source, including any math expression (e.g. '793-245' or '500'). Code evaluates this — do not pre-compute." },
+        "resolutions": {
+          "type": "ARRAY",
+          "description": "One entry per DISTINCT person name used in payer/fixed_splits/weighted_splits, reporting how confidently it maps to a Known person.",
+          "items": {
+            "type": "OBJECT",
+            "properties": {
+              "name": { "type": "STRING", "description": "the name exactly as it appears in your splits/payer output" },
+              "typed": { "type": "STRING", "description": "the ORIGINAL token the user actually wrote for this person (e.g. 'Mang'), even if you output the canonical Name elsewhere" },
+              "status": { "type": "STRING", "enum": ["resolved", "ambiguous", "unknown"], "description": "resolved=maps to exactly one Known person; ambiguous=could be 2+ Known people; unknown=nobody Known matches" },
+              "canonical": { "type": "STRING", "description": "exact canonical Name of the matched Known person when status=resolved; else null" },
+              "candidates": { "type": "ARRAY", "items": { "type": "STRING" }, "description": "2+ canonical Names when status=ambiguous; else empty" }
+            },
+            "required": ["name", "typed", "status"]
+          }
+        }
+      },
+      "required": ["date", "description", "category", "total_amount", "payer", "fixed_splits", "weighted_splits"]
+    }
+  };
+}
+
+// Everything after Gemini answers: arithmetic, split calculation, name resolution, the owner-payer
+// limit, the Splitwise push, the Notion write and the Telegram reply. Shared verbatim by both paths;
+// opts.kind picks the only two cosmetic differences (reply header, re-send noun).
+function finalizeExpense_(parsedJson, ctx, opts) {
+  var token = opts.token, chatId = opts.chatId, messageId = opts.messageId;
+  var ownerName = opts.ownerName, tag = opts.tag, cfg = ctx.cfg;
+
+  // R10 — evaluate arithmetic in code (Gemini returns the raw expression); fall back to its number.
+  var rawTotal = safeEvalArithmetic_(parsedJson.total_amount_raw);
+  if (isFinite(rawTotal) && rawTotal > 0) parsedJson.total_amount = rawTotal;
+  if (parsedJson.fixed_splits) for (var fx = 0; fx < parsedJson.fixed_splits.length; fx++) {
+    var fev = safeEvalArithmetic_(parsedJson.fixed_splits[fx].amount);
+    if (isFinite(fev)) parsedJson.fixed_splits[fx].amount = fev;
+  }
+
+  // No usable amount — refuse rather than record a ₹0.00 row. Without this any non-expense chatter
+  // ("thanks", "ok") lands in the ledger as a zero-rupee expense.
+  if (!(parseFloat(parsedJson.total_amount) > 0)) {
+    logToSheet("⚠️ " + tag + " Blocked: no positive total amount parsed.");
+    sendTelegramMessage(token, chatId, "🤔 **Not logged — I couldn't find an amount in that.**\nTry `100 chai via UPI`, or /help for examples.", messageId, "Markdown");
+    return;
+  }
+
+  // Fixed amounts at/over the total would silently drop the "split the rest" people — refuse.
+  var planErr = checkFixedVsTotal_(parsedJson);
+  if (planErr) {
+    logToSheet("⚠️ " + tag + " Blocked: fixed splits >= total with weighted participants.");
+    sendTelegramMessage(token, chatId, planErr, messageId, "Markdown");
+    return;
+  }
+
+  // Calculate exact splits programmatically using JS
+  parsedJson.splits = calculateSplits(parsedJson);
+  logToSheet("⚖️ " + tag + " Programmatically calculated splits: " + JSON.stringify(parsedJson.splits));
+
+  // §14 — resolve participant/payer names against Notion People (tiered), rewrite resolved → canonical.
+  var resolution = null;
+  if (cfg) {
+    try { resolution = resolveNames_(cfg, parsedJson, ownerName, ctx.peopleRows); applyResolution_(parsedJson, resolution); }
+    catch (rerr) { logToSheet("§14 resolve error: " + rerr); }
+  }
+
+  // Enforce owner-payer hard limit — AFTER resolution, so a nickname/short form of the
+  // owner's own name compares in canonical form instead of falsely blocking.
+  if ((parsedJson.payer || "").toLowerCase().trim() !== ownerName.toLowerCase().trim()) {
+    logToSheet("⚠️ " + tag + " Blocked transaction: Payer is not the owner. Payer: " + parsedJson.payer + ", Owner: " + ownerName);
+    sendTelegramMessage(token, chatId, "❌ **Not logged — you weren't the payer.**\nIronBank only records expenses **" + ownerName + "** paid (this is what prevents duplicate Splitwise entries when several people run IronBank).\n\nSince **" + parsedJson.payer + "** paid: ask them to log it on their IronBank, or add it directly in Splitwise — either way it lands in your Notion automatically on the next sync.", messageId, "Markdown");
+    return;
+  }
+  // R10 — do the splits tally to the total? (calculateSplits distributes to match; a miss = parse error.)
+  var sumWarn = checkSplitSum_(parsedJson.splits, parsedJson.total_amount) ? "" : "\n\n⚠️ *Split total doesn't match the amount — please double-check.*";
+
+  // Push to Splitwise — per-person routing: each participant goes to their Default Group
+  // bucket (or the direct/non-group bucket when they have none); the owner's share stays
+  // Notion-only. No group names in messages — one expense can span several groups.
+  // If any participant isn't set up yet, the whole expense parks as Needs mapping.
+  var syncNote = "";
+  var swToken = getSetting("SPLITWISE_TOKEN");
+  if (swToken && cfg && parsedJson.splits && parsedJson.splits.length > 1) {
+    var planRes = executePushPlan_(cfg, swToken, parsedJson, ownerName, ctx.peopleRows);
+    if (planRes.success) {
+      parsedJson.splitwise_id = planRes.ids.join(",");
+      parsedJson.splitwise_group_id = planRes.gids.join(",");
+      parsedJson.splitwise_updated_at = planRes.updatedAt;
+      syncNote = formatSyncNote_(planRes.groups);
+    } else {
+      syncNote = "\n\n⚠️ **Splitwise Sync Pending:** " + planRes.park +
+                 "\n_Parked — set the person up in Notion → People (pick their Splitwise Identity) and it will push on the next sync._";
+    }
+  }
+
+  var notionPageId = recordExpense_(parsedJson, opts.auditText, opts.source);
+  if (!notionPageId) {
+    // Never claim success when the ledger write failed.
+    var failMsg = parsedJson.splitwise_id
+      ? "⚠️ **Pushed to Splitwise but NOT recorded in Notion** (write failed). The sync will re-import it within ~15 min without category/payment details — or delete it in Splitwise and re-send."
+      : "⚠️ **Not recorded** — the Notion write failed and nothing was saved. Please re-send the " + opts.resendNoun + ".";
+    sendTelegramMessage(token, chatId, failMsg, messageId, "Markdown");
+    return;
+  }
+  logToSheet(tag + " Saved to Notion. Page: " + notionPageId);
+
+  // §14 — learn aliases from Gemini fuzzy-resolves (typed → canonical), enforcing the uniqueness invariant.
+  if (cfg && resolution) {
+    for (var li = 0; li < resolution.learn.length; li++) {
+      try { saveAlias_(cfg, resolution.learn[li].pageId, resolution.learn[li].typed, resolution.idx); } catch (ae) { logToSheet("§14 alias save err: " + ae); }
+    }
+  }
+
+  // Format reply — echo canonical names (safety net §14.10) + flag unknown/ambiguous participants.
+  var payMode = parsedJson.payment_mode || "Unknown";
+  var reply = (opts.kind === "photo"
+      ? "📸 **Receipt Logged!**\n" +
+        "🏢 **Store:** " + parsedJson.description + " (" + parsedJson.category + ")\n" +
+        "📅 **Date:** " + parsedJson.date + "\n"
+      : "✅ **Logged Expense!**\n" +
+        "📅 **Date:** " + parsedJson.date + "\n" +
+        "📝 **Desc:** " + parsedJson.description + " (" + parsedJson.category + ")\n") +
+    "💳 **Mode:** " + payMode + "\n" +
+    "💰 **Total:** ₹" + parsedJson.total_amount.toFixed(2) + " paid by **" + parsedJson.payer + "**\n\n" +
+    "👥 **Split:**\n";
+
+  for (var i = 0; i < parsedJson.splits.length; i++) {
+    var sn = parsedJson.splits[i].name, mark = "";
+    if (resolution) {
+      for (var ui = 0; ui < resolution.unknown.length; ui++) if (resolution.unknown[ui] === sn) { mark = " _(new — set up in Notion)_"; break; }
+      if (!mark) for (var qi = 0; qi < resolution.ambiguous.length; qi++) if (resolution.ambiguous[qi].typed === sn) { mark = " _(ambiguous — pick below)_"; break; }
+    }
+    reply += "- " + sn + ": ₹" + parsedJson.splits[i].amount.toFixed(2) + mark + "\n";
+  }
+  reply += syncNote + sumWarn;
+
+  var replyMarkup = {
+    "inline_keyboard": [[
+      { "text": "🗑️ Delete", "callback_data": "delete_" + notionPageId }
+    ]]
+  };
+
+  sendTelegramMessage(token, chatId, reply, messageId, "Markdown", replyMarkup);
+
+  // D-ID1=A — ask about ambiguous names with inline candidate buttons.
+  if (cfg && resolution && resolution.ambiguous.length) {
+    sendDisambiguationButtons_(token, chatId, cfg, notionPageId, resolution.ambiguous);
+  }
+}
 
 function processExpenseText(text, geminiKey, token, chatId, messageId, ownerName) {
   try {
@@ -438,54 +701,21 @@ function processExpenseText(text, geminiKey, token, chatId, messageId, ownerName
       return;
     }
 
-    var today = Utilities.formatDate(new Date(), "GMT+5:30", "yyyy-MM-dd");
-    // §14 — feed Gemini the Notion People roster (canonical Name + Aliases) so it normalises
-    // nicknames/typos to canonical names. Fall back to the Sheet list if Notion isn't configured or errors
-    // (roster fetch must never break expense logging).
-    var cfgRoster = getNotionConfig();
-    var roster, peopleRows = null;
-    try {
-      if (cfgRoster) {
-        peopleRows = fetchPeople_(cfgRoster);   // one scan powers roster + resolution + routing
-        roster = getPeopleRosterForAI(cfgRoster, ownerName, peopleRows);
-      } else {
-        roster = rosterFallback_(ownerName);
-      }
-    } catch (rosterErr) {
-      logToSheet("roster fetch failed, using last-good cached roster: " + rosterErr);
-      peopleRows = null;
-      roster = rosterFallback_(ownerName);
-    }
-    var knownNames = roster.names;
-    var allowedPaymentModes = getAllowedPaymentModes(cfgRoster);
-    var paymentModeEnum = allowedPaymentModes.concat(["Unknown"]);
-    var allowedCategories = getAllowedCategories(cfgRoster);
+    var ctx = prepareExpenseContext_(ownerName);
 
     var prompt = "Extract transaction details from this natural language description.\n" +
       "Context information:\n" +
-      "- Current date: " + today + "\n" +
-      "- Bot owner name: " + ownerName + " (Map 'I', 'me', 'my', 'myself' to this name)\n" +
-      "- Known people (resolve EACH participant + the payer to one of these canonical names — match nicknames, the aliases shown in parentheses, and obvious typos, e.g. 'Mang'→'Mangalik'. Output the canonical Name, not the typed form. Only keep a name exactly as typed if nobody here plausibly matches): " + roster.text + "\n" +
-      "  Also output a 'resolutions' array with one entry per DISTINCT name you use (payer + every split name): {name, typed, status, canonical, candidates}. Always set 'typed' to the ORIGINAL token the user literally wrote for that person (e.g. 'Mang'), even when 'name'/'canonical' is the normalized Name. status='resolved' when exactly one Known person matches — set canonical to their exact Name AND use that canonical Name in the splits. status='ambiguous' when 2+ Known people plausibly match (e.g. 'Adi' when both Aditya and Aditi exist) — list them in candidates and keep the name AS TYPED. status='unknown' when nobody Known matches — keep the name AS TYPED. Never guess between two people.\n" +
-      "  Also output 'total_amount_raw' = the total amount exactly as written (including any math expression).\n" +
-      "- Allowed payment modes: " + JSON.stringify(allowedPaymentModes) + "\n" +
-      "- Allowed categories: " + JSON.stringify(allowedCategories) + "\n\n" +
+      expensePromptContext_(ctx, ownerName) +
       "Rules:\n" +
       "1. Deduce the payer. If the text says someone else paid, use their name. If not specified or if 'I paid' is implied, the payer is '" + ownerName + "'.\n" +
-      "2. Deduce split instructions. Instead of calculating split amounts yourself, separate them into:\n" +
-      "   - fixed_splits: People who owe a specific fixed amount (e.g. A had 800).\n" +
-      "   - weighted_splits: People who share the remainder. Give a weight of 1 to each person splitting the remainder equally (e.g. if A, B, C split equally, add each with weight: 1).\n" +
-      "   - If the total amount is split equally among everyone (e.g. A and B split 50-50), leave fixed_splits empty, and put them in weighted_splits with weight 1.\n" +
+      expenseSplitRules_(ownerName, 2) +
       "3. Categorize the expense. Select the category that fits the most from the allowed categories list. If nothing fits, use 'Other'. If the user explicitly states a category, use that exact category (as long as it's in the allowed list) — a stated category always takes precedence over your own guess.\n" +
-      "4. For relative dates like 'yesterday', calculate the correct YYYY-MM-DD relative to " + today + ".\n" +
+      "4. For relative dates like 'yesterday', calculate the correct YYYY-MM-DD relative to " + ctx.today + ".\n" +
       "5. Identify the payment mode. Map terms like 'gpay', 'phonepe', 'upi' to 'UPI', 'cc' or 'card' to 'Credit Card', 'cash' to 'Cash'. User overrides take precedence.\n" +
       "6. Calculate the total_amount: If the transaction amount in the text is a mathematical expression (e.g., contains addition '+', subtraction '-', or multiplication '*'), evaluate the expression to find the final single numeric result (e.g., '793-245' must be evaluated to 548) and return that evaluated number as the total_amount. Do not just return the first number.\n" +
       "7. For fixed_splits: If any person's fixed split amount is given as a mathematical expression (e.g., '100+50'), evaluate the expression to a single numeric value (e.g., 150) before outputting it.\n" +
-      "8. For per-item lists with mixed or complex split groupings (e.g., 'G1: 100, G2: 200, G3: 300, G4: 400. Split G2 and G3 between A and I, and the rest between A, B, and I'):\n" +
-      "   - Identify all items and their values.\n" +
-      "   - Calculate each person's total share by dividing the cost of each item among its designated split group and summing their shares across all items (map 'I', 'me', 'my', 'myself' to '" + ownerName + "').\n" +
-      "   - Represent all these summed shares in the 'fixed_splits' array (including the owner '" + ownerName + "' if they have a share).\n" +
-      "   - Leave 'weighted_splits' empty in this case.\n" +
+      expensePerItemRule_(ownerName, 8, "in the text",
+        "G1: 100, G2: 200, G3: 300, G4: 400. Split G2 and G3 between A and I, and the rest between A, B, and I") +
       "Text to parse:\n\"" + text + "\"";
 
     var url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + geminiKey;
@@ -494,59 +724,7 @@ function processExpenseText(text, geminiKey, token, chatId, messageId, ownerName
       "contents": [{
         "parts": [{ "text": prompt }]
       }],
-      "generationConfig": {
-        "responseMimeType": "application/json",
-        "responseSchema": {
-          "type": "OBJECT",
-          "properties": {
-            "date": { "type": "STRING", "description": "YYYY-MM-DD format" },
-            "description": { "type": "STRING", "description": "Brief description of what it was for" },
-            "category": { "type": "STRING", "enum": allowedCategories },
-            "total_amount": { "type": "NUMBER", "description": "The total cost of the transaction. If the description contains a math expression for the amount, evaluate it to a single numeric value." },
-            "payer": { "type": "STRING" },
-            "payment_mode": { "type": "STRING", "enum": paymentModeEnum, "description": "MUST be one of the allowed payment modes; use 'Unknown' if none is identified" },
-            "fixed_splits": {
-              "type": "ARRAY",
-              "items": {
-                "type": "OBJECT",
-                "properties": {
-                  "name": { "type": "STRING" },
-                  "amount": { "type": "NUMBER", "description": "Exact fixed amount this person owes. If it is a math expression, evaluate it first to a single numeric value." }
-                },
-                "required": ["name", "amount"]
-              }
-            },
-            "weighted_splits": {
-              "type": "ARRAY",
-              "items": {
-                "type": "OBJECT",
-                "properties": {
-                  "name": { "type": "STRING" },
-                  "weight": { "type": "NUMBER", "description": "Relative weight share of the remainder (usually 1)" }
-                },
-                "required": ["name", "weight"]
-              }
-            },
-            "total_amount_raw": { "type": "STRING", "description": "The total amount EXACTLY as written in the source, including any math expression (e.g. '793-245' or '500'). Code evaluates this — do not pre-compute." },
-            "resolutions": {
-              "type": "ARRAY",
-              "description": "One entry per DISTINCT person name used in payer/fixed_splits/weighted_splits, reporting how confidently it maps to a Known person.",
-              "items": {
-                "type": "OBJECT",
-                "properties": {
-                  "name": { "type": "STRING", "description": "the name exactly as it appears in your splits/payer output" },
-                  "typed": { "type": "STRING", "description": "the ORIGINAL token the user actually wrote for this person (e.g. 'Mang'), even if you output the canonical Name elsewhere" },
-                  "status": { "type": "STRING", "enum": ["resolved", "ambiguous", "unknown"], "description": "resolved=maps to exactly one Known person; ambiguous=could be 2+ Known people; unknown=nobody Known matches" },
-                  "canonical": { "type": "STRING", "description": "exact canonical Name of the matched Known person when status=resolved; else null" },
-                  "candidates": { "type": "ARRAY", "items": { "type": "STRING" }, "description": "2+ canonical Names when status=ambiguous; else empty" }
-                },
-                "required": ["name", "typed", "status"]
-              }
-            }
-          },
-          "required": ["date", "description", "category", "total_amount", "payer", "fixed_splits", "weighted_splits"]
-        }
-      }
+      "generationConfig": expenseGenerationConfig_(ctx, "Brief description of what it was for")
     };
 
     var options = {
@@ -567,114 +745,10 @@ function processExpenseText(text, geminiKey, token, chatId, messageId, ownerName
     var resObj = JSON.parse(responseText);
     var parsedJson = JSON.parse(resObj.candidates[0].content.parts[0].text);
 
-    // R10 — evaluate arithmetic in code (Gemini returns the raw expression); fall back to its number.
-    var rawTotal = safeEvalArithmetic_(parsedJson.total_amount_raw);
-    if (isFinite(rawTotal) && rawTotal > 0) parsedJson.total_amount = rawTotal;
-    if (parsedJson.fixed_splits) for (var fx = 0; fx < parsedJson.fixed_splits.length; fx++) {
-      var fev = safeEvalArithmetic_(parsedJson.fixed_splits[fx].amount);
-      if (isFinite(fev)) parsedJson.fixed_splits[fx].amount = fev;
-    }
-
-    // Fixed amounts at/over the total would silently drop the "split the rest" people — refuse.
-    var planErr = checkFixedVsTotal_(parsedJson);
-    if (planErr) {
-      logToSheet("⚠️ [processExpenseText] Blocked: fixed splits >= total with weighted participants.");
-      sendTelegramMessage(token, chatId, planErr, messageId, "Markdown");
-      return;
-    }
-
-    // Calculate exact splits programmatically using JS
-    parsedJson.splits = calculateSplits(parsedJson);
-    logToSheet("⚖️ [processExpenseText] Programmatically calculated splits: " + JSON.stringify(parsedJson.splits));
-
-    // §14 — resolve participant/payer names against Notion People (tiered), rewrite resolved → canonical.
-    var cfg14 = getNotionConfig();
-    var resolution = null;
-    if (cfg14) {
-      try { resolution = resolveNames_(cfg14, parsedJson, ownerName, peopleRows); applyResolution_(parsedJson, resolution); }
-      catch (rerr) { logToSheet("§14 resolve error: " + rerr); }
-    }
-
-    // Enforce owner-payer hard limit — AFTER resolution, so a nickname/short form of the
-    // owner's own name compares in canonical form instead of falsely blocking.
-    if ((parsedJson.payer || "").toLowerCase().trim() !== ownerName.toLowerCase().trim()) {
-      logToSheet("⚠️ [processExpenseText] Blocked transaction: Payer is not the owner. Payer: " + parsedJson.payer + ", Owner: " + ownerName);
-      sendTelegramMessage(token, chatId, "❌ **Not logged — you weren't the payer.**\nIronBank only records expenses **" + ownerName + "** paid (this is what prevents duplicate Splitwise entries when several people run IronBank).\n\nSince **" + parsedJson.payer + "** paid: ask them to log it on their IronBank, or add it directly in Splitwise — either way it lands in your Notion automatically on the next sync.", messageId, "Markdown");
-      return;
-    }
-    // R10 — do the splits tally to the total? (calculateSplits distributes to match; a miss = parse error.)
-    var sumWarn = checkSplitSum_(parsedJson.splits, parsedJson.total_amount) ? "" : "\n\n⚠️ *Split total doesn't match the amount — please double-check.*";
-
-    // Push to Splitwise — per-person routing: each participant goes to their Default Group
-    // bucket (or the direct/non-group bucket when they have none); the owner's share stays
-    // Notion-only. No group names in messages — one expense can span several groups.
-    // If any participant isn't set up yet, the whole expense parks as Needs mapping.
-    var syncNote = "";
-    var swToken = getSetting("SPLITWISE_TOKEN");
-    if (swToken && parsedJson.splits && parsedJson.splits.length > 1) {
-      var cfgPush = getNotionConfig();
-      if (cfgPush) {
-        var planRes = executePushPlan_(cfgPush, swToken, parsedJson, ownerName, peopleRows);
-        if (planRes.success) {
-          parsedJson.splitwise_id = planRes.ids.join(",");
-          parsedJson.splitwise_group_id = planRes.gids.join(",");
-          parsedJson.splitwise_updated_at = planRes.updatedAt;
-          syncNote = formatSyncNote_(planRes.groups);
-        } else {
-          syncNote = "\n\n⚠️ **Splitwise Sync Pending:** " + planRes.park +
-                     "\n_Parked — set the person up in Notion → People (pick their Splitwise Identity) and it will push on the next sync._";
-        }
-      }
-    }
-
-    var notionPageId = recordExpense_(parsedJson, text, "Telegram");
-    if (!notionPageId) {
-      // Never claim success when the ledger write failed.
-      var failMsg = parsedJson.splitwise_id
-        ? "⚠️ **Pushed to Splitwise but NOT recorded in Notion** (write failed). The sync will re-import it within ~15 min without category/payment details — or delete it in Splitwise and re-send."
-        : "⚠️ **Not recorded** — the Notion write failed and nothing was saved. Please re-send the expense.";
-      sendTelegramMessage(token, chatId, failMsg, messageId, "Markdown");
-      return;
-    }
-
-    // §14 — learn aliases from Gemini fuzzy-resolves (typed → canonical), enforcing the uniqueness invariant.
-    if (cfg14 && resolution) {
-      for (var li = 0; li < resolution.learn.length; li++) {
-        try { saveAlias_(cfg14, resolution.learn[li].pageId, resolution.learn[li].typed, resolution.idx); } catch (ae) { logToSheet("§14 alias save err: " + ae); }
-      }
-    }
-
-    // Format reply — echo canonical names (safety net §14.10) + flag unknown/ambiguous participants.
-    var payMode = parsedJson.payment_mode || "Unknown";
-    var reply = "✅ **Logged Expense!**\n" +
-      "📅 **Date:** " + parsedJson.date + "\n" +
-      "📝 **Desc:** " + parsedJson.description + " (" + parsedJson.category + ")\n" +
-      "💳 **Mode:** " + payMode + "\n" +
-      "💰 **Total:** ₹" + parsedJson.total_amount.toFixed(2) + " paid by **" + parsedJson.payer + "**\n\n" +
-      "👥 **Split:**\n";
-
-    for (var i = 0; i < parsedJson.splits.length; i++) {
-      var sn = parsedJson.splits[i].name, tag = "";
-      if (resolution) {
-        for (var ui = 0; ui < resolution.unknown.length; ui++) if (resolution.unknown[ui] === sn) { tag = " _(new — set up in Notion)_"; break; }
-        if (!tag) for (var qi = 0; qi < resolution.ambiguous.length; qi++) if (resolution.ambiguous[qi].typed === sn) { tag = " _(ambiguous — pick below)_"; break; }
-      }
-      reply += "- " + sn + ": ₹" + parsedJson.splits[i].amount.toFixed(2) + tag + "\n";
-    }
-    reply += syncNote + sumWarn;
-
-    var replyMarkup = {
-      "inline_keyboard": [[
-        { "text": "🗑️ Delete", "callback_data": "delete_" + notionPageId }
-      ]]
-    };
-
-    sendTelegramMessage(token, chatId, reply, messageId, "Markdown", replyMarkup);
-
-    // D-ID1=A — ask about ambiguous names with inline candidate buttons.
-    if (cfg14 && resolution && resolution.ambiguous.length && notionPageId) {
-      sendDisambiguationButtons_(token, chatId, cfg14, notionPageId, resolution.ambiguous);
-    }
+    finalizeExpense_(parsedJson, ctx, {
+      kind: "text", token: token, chatId: chatId, messageId: messageId, ownerName: ownerName,
+      tag: "[processExpenseText]", source: "Telegram", auditText: text, resendNoun: "expense"
+    });
   } catch (err) {
     logToSheet("🚨 [processExpenseText] Caught exception: " + err.toString());
     var retryData = {
@@ -734,54 +808,22 @@ function processReceiptPhoto(photoArray, caption, geminiKey, token, chatId, mess
     logToSheet("📷 [processReceiptPhoto] Base64 encoding complete. MIME: " + mimeType);
 
     // 5. Prepare parameters for Gemini
-    var today = Utilities.formatDate(new Date(), "GMT+5:30", "yyyy-MM-dd");
-    // §14 — feed Gemini the Notion People roster (canonical Name + Aliases) so it normalises
-    // nicknames/typos to canonical names. Fall back to the Sheet list if Notion isn't configured or errors
-    // (roster fetch must never break expense logging).
-    var cfgRoster = getNotionConfig();
-    var roster, peopleRows = null;
-    try {
-      if (cfgRoster) {
-        peopleRows = fetchPeople_(cfgRoster);   // one scan powers roster + resolution + routing
-        roster = getPeopleRosterForAI(cfgRoster, ownerName, peopleRows);
-      } else {
-        roster = rosterFallback_(ownerName);
-      }
-    } catch (rosterErr) {
-      logToSheet("roster fetch failed, using last-good cached roster: " + rosterErr);
-      peopleRows = null;
-      roster = rosterFallback_(ownerName);
-    }
-    var knownNames = roster.names;
-    var allowedPaymentModes = getAllowedPaymentModes(cfgRoster);
-    var paymentModeEnum = allowedPaymentModes.concat(["Unknown"]);
-    var allowedCategories = getAllowedCategories(cfgRoster);
+    var ctx = prepareExpenseContext_(ownerName);
 
     var prompt = "Extract transaction details from this receipt/invoice image.\n\n" +
       "Context details:\n" +
-      "- Today's date: " + today + "\n" +
-      "- Bot owner name: " + ownerName + " (Map 'I', 'me', 'my', 'myself' to this name)\n" +
-      "- Known people (resolve EACH participant + the payer to one of these canonical names — match nicknames, the aliases shown in parentheses, and obvious typos, e.g. 'Mang'→'Mangalik'. Output the canonical Name, not the typed form. Only keep a name exactly as typed if nobody here plausibly matches): " + roster.text + "\n" +
-      "  Also output a 'resolutions' array with one entry per DISTINCT name you use (payer + every split name): {name, typed, status, canonical, candidates}. Always set 'typed' to the ORIGINAL token the user literally wrote for that person (e.g. 'Mang'), even when 'name'/'canonical' is the normalized Name. status='resolved' when exactly one Known person matches — set canonical to their exact Name AND use that canonical Name in the splits. status='ambiguous' when 2+ Known people plausibly match (e.g. 'Adi' when both Aditya and Aditi exist) — list them in candidates and keep the name AS TYPED. status='unknown' when nobody Known matches — keep the name AS TYPED. Never guess between two people.\n" +
-      "  Also output 'total_amount_raw' = the total amount exactly as written (including any math expression).\n" +
-      "- Allowed payment modes: " + JSON.stringify(allowedPaymentModes) + "\n" +
-      "- Allowed categories: " + JSON.stringify(allowedCategories) + "\n\n" +
+      expensePromptContext_(ctx, ownerName) +
       "User input instructions / caption (if any): \"" + caption + "\"\n\n" +
       "Rules:\n" +
-      "1. Deduce the date printed on the receipt. Format as YYYY-MM-DD. If date is not visible or blurry, use " + today + ".\n" +
+      "1. Deduce the date printed on the receipt. Format as YYYY-MM-DD. If date is not visible or blurry, use " + ctx.today + ".\n" +
       "2. Identify the store name or merchant for the description.\n" +
       "3. Extract the final total_amount. If this is not a photo of a receipt or invoice, or no total can be found, set total_amount to 0, description to 'Invalid Receipt', and category to 'Other'.\n" +
-      "4. Deduce split instructions. Instead of calculating split amounts yourself, separate them into:\n" +
-      "   - fixed_splits: People who owe a specific fixed amount (e.g. A had 800).\n" +
-      "   - weighted_splits: People who share the remainder. Give a weight of 1 to each person splitting the remainder equally (e.g. A, B, C split equally, add each with weight: 1).\n" +
-      "   - If the user caption is empty or does not mention split directions, leave fixed_splits empty, and put only the owner '" + ownerName + "' in weighted_splits with weight 1.\n" +
+      expenseSplitRules_(ownerName, 4) +
       "5. Map the transaction category to one of the allowed categories. If no category fits, use 'Other'. If the user caption explicitly states a category, use that exact category (as long as it's in the allowed list) — a stated category always takes precedence over your own guess.\n" +
       "6. Map the payment method to one of the allowed payment modes. Map cards/numbers to 'Credit Card' or matching card name, UPI keywords to 'UPI', cash to 'Cash'. User caption overrides take precedence.\n" +
       "7. If the user caption has a mathematical expression for the amount, or if any person's split instructions in the caption contain math expressions, evaluate the expression to a single numeric value before outputting it.\n" +
-      "8. For per-item lists on the receipt/invoice with mixed or complex split groupings specified in the caption (e.g., 'item 1 split between A and B, rest split between A, B, and me'):\n" +
-      "   - Calculate each person's total share by dividing the cost of each item on the receipt/invoice among its designated split group and summing their shares across all items (map 'I', 'me', 'my', 'myself' to '" + ownerName + "').\n" +
-      "   - Represent all these summed shares in the 'fixed_splits' array (including the owner '" + ownerName + "' if they have a share).\n" +
-      "   - Leave 'weighted_splits' empty in this case.\n";
+      expensePerItemRule_(ownerName, 8, "on the receipt/invoice, grouped as the caption specifies",
+        "item 1 split between A and B, rest split between A, B, and me");
 
     var url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + geminiKey;
     logToSheet("📷 [processReceiptPhoto] Calling Gemini 2.5 Flash API with retry...");
@@ -800,59 +842,7 @@ function processReceiptPhoto(photoArray, caption, geminiKey, token, chatId, mess
           }
         ]
       }],
-      "generationConfig": {
-        "responseMimeType": "application/json",
-        "responseSchema": {
-          "type": "OBJECT",
-          "properties": {
-            "date": { "type": "STRING", "description": "YYYY-MM-DD format" },
-            "description": { "type": "STRING", "description": "Merchant/Store Name" },
-            "category": { "type": "STRING", "enum": allowedCategories },
-            "total_amount": { "type": "NUMBER", "description": "The total cost of the transaction. If the description contains a math expression for the amount, evaluate it to a single numeric value." },
-            "payer": { "type": "STRING" },
-            "payment_mode": { "type": "STRING", "enum": paymentModeEnum, "description": "MUST be one of the allowed payment modes; use 'Unknown' if none is identified" },
-            "fixed_splits": {
-              "type": "ARRAY",
-              "items": {
-                "type": "OBJECT",
-                "properties": {
-                  "name": { "type": "STRING" },
-                  "amount": { "type": "NUMBER", "description": "Exact fixed amount this person owes. If it is a math expression, evaluate it first to a single numeric value." }
-                },
-                "required": ["name", "amount"]
-              }
-            },
-            "weighted_splits": {
-              "type": "ARRAY",
-              "items": {
-                "type": "OBJECT",
-                "properties": {
-                  "name": { "type": "STRING" },
-                  "weight": { "type": "NUMBER", "description": "Relative weight share of the remainder (usually 1)" }
-                },
-                "required": ["name", "weight"]
-              }
-            },
-            "total_amount_raw": { "type": "STRING", "description": "The total amount EXACTLY as written in the source, including any math expression (e.g. '793-245' or '500'). Code evaluates this — do not pre-compute." },
-            "resolutions": {
-              "type": "ARRAY",
-              "description": "One entry per DISTINCT person name used in payer/fixed_splits/weighted_splits, reporting how confidently it maps to a Known person.",
-              "items": {
-                "type": "OBJECT",
-                "properties": {
-                  "name": { "type": "STRING", "description": "the name exactly as it appears in your splits/payer output" },
-                  "typed": { "type": "STRING", "description": "the ORIGINAL token the user actually wrote for this person (e.g. 'Mang'), even if you output the canonical Name elsewhere" },
-                  "status": { "type": "STRING", "enum": ["resolved", "ambiguous", "unknown"], "description": "resolved=maps to exactly one Known person; ambiguous=could be 2+ Known people; unknown=nobody Known matches" },
-                  "canonical": { "type": "STRING", "description": "exact canonical Name of the matched Known person when status=resolved; else null" },
-                  "candidates": { "type": "ARRAY", "items": { "type": "STRING" }, "description": "2+ canonical Names when status=ambiguous; else empty" }
-                },
-                "required": ["name", "typed", "status"]
-              }
-            }
-          },
-          "required": ["date", "description", "category", "total_amount", "payer", "fixed_splits", "weighted_splits"]
-        }
-      }
+      "generationConfig": expenseGenerationConfig_(ctx, "Merchant/Store Name")
     };
 
     var options = {
@@ -889,115 +879,11 @@ function processReceiptPhoto(photoArray, caption, geminiKey, token, chatId, mess
       return;
     }
 
-    // R10 — evaluate arithmetic in code (Gemini returns the raw expression); fall back to its number.
-    var rawTotal = safeEvalArithmetic_(parsedJson.total_amount_raw);
-    if (isFinite(rawTotal) && rawTotal > 0) parsedJson.total_amount = rawTotal;
-    if (parsedJson.fixed_splits) for (var fx = 0; fx < parsedJson.fixed_splits.length; fx++) {
-      var fev = safeEvalArithmetic_(parsedJson.fixed_splits[fx].amount);
-      if (isFinite(fev)) parsedJson.fixed_splits[fx].amount = fev;
-    }
-
-    // Fixed amounts at/over the total would silently drop the "split the rest" people — refuse.
-    var planErr = checkFixedVsTotal_(parsedJson);
-    if (planErr) {
-      logToSheet("⚠️ [processReceiptPhoto] Blocked: fixed splits >= total with weighted participants.");
-      sendTelegramMessage(token, chatId, planErr, messageId, "Markdown");
-      return;
-    }
-
-    // Calculate exact splits programmatically using JS
-    parsedJson.splits = calculateSplits(parsedJson);
-    logToSheet("⚖️ [processReceiptPhoto] Programmatically calculated splits: " + JSON.stringify(parsedJson.splits));
-
-    // §14 — resolve participant/payer names against Notion People (tiered), rewrite resolved → canonical.
-    var cfg14 = getNotionConfig();
-    var resolution = null;
-    if (cfg14) {
-      try { resolution = resolveNames_(cfg14, parsedJson, ownerName, peopleRows); applyResolution_(parsedJson, resolution); }
-      catch (rerr) { logToSheet("§14 resolve error: " + rerr); }
-    }
-
-    // Enforce owner-payer hard limit — AFTER resolution, so a nickname/short form of the
-    // owner's own name compares in canonical form instead of falsely blocking.
-    if ((parsedJson.payer || "").toLowerCase().trim() !== ownerName.toLowerCase().trim()) {
-      logToSheet("⚠️ [processReceiptPhoto] Blocked transaction: Payer is not the owner. Payer: " + parsedJson.payer + ", Owner: " + ownerName);
-      sendTelegramMessage(token, chatId, "❌ **Not logged — you weren't the payer.**\nIronBank only records expenses **" + ownerName + "** paid (this is what prevents duplicate Splitwise entries when several people run IronBank).\n\nSince **" + parsedJson.payer + "** paid: ask them to log it on their IronBank, or add it directly in Splitwise — either way it lands in your Notion automatically on the next sync.", messageId, "Markdown");
-      return;
-    }
-    var sumWarn = checkSplitSum_(parsedJson.splits, parsedJson.total_amount) ? "" : "\n\n⚠️ *Split total doesn't match the amount — please double-check.*";
-
-    // Push to Splitwise — per-person routing: each participant goes to their Default Group
-    // bucket (or the direct/non-group bucket when they have none); the owner's share stays
-    // Notion-only. No group names in messages — one expense can span several groups.
-    // If any participant isn't set up yet, the whole expense parks as Needs mapping.
-    var syncNote = "";
-    var swToken = getSetting("SPLITWISE_TOKEN");
-    if (swToken && parsedJson.splits && parsedJson.splits.length > 1) {
-      var cfgPush = getNotionConfig();
-      if (cfgPush) {
-        var planRes = executePushPlan_(cfgPush, swToken, parsedJson, ownerName, peopleRows);
-        if (planRes.success) {
-          parsedJson.splitwise_id = planRes.ids.join(",");
-          parsedJson.splitwise_group_id = planRes.gids.join(",");
-          parsedJson.splitwise_updated_at = planRes.updatedAt;
-          syncNote = formatSyncNote_(planRes.groups);
-        } else {
-          syncNote = "\n\n⚠️ **Splitwise Sync Pending:** " + planRes.park +
-                     "\n_Parked — set the person up in Notion → People (pick their Splitwise Identity) and it will push on the next sync._";
-        }
-      }
-    }
-
-    var originalPromptAudit = "Receipt Photo" + (caption ? " (" + caption + ")" : "");
-    var notionPageId = recordExpense_(parsedJson, originalPromptAudit, "Telegram Receipt Scanning");
-    if (!notionPageId) {
-      // Never claim success when the ledger write failed.
-      var failMsg = parsedJson.splitwise_id
-        ? "⚠️ **Pushed to Splitwise but NOT recorded in Notion** (write failed). The sync will re-import it within ~15 min without category/payment details — or delete it in Splitwise and re-send."
-        : "⚠️ **Not recorded** — the Notion write failed and nothing was saved. Please re-send the receipt.";
-      sendTelegramMessage(token, chatId, failMsg, messageId, "Markdown");
-      return;
-    }
-    logToSheet("📷 [processReceiptPhoto] Saved to Notion. Page: " + notionPageId);
-
-    // §14 — learn aliases from Gemini fuzzy-resolves (typed → canonical), enforcing the uniqueness invariant.
-    if (cfg14 && resolution) {
-      for (var li = 0; li < resolution.learn.length; li++) {
-        try { saveAlias_(cfg14, resolution.learn[li].pageId, resolution.learn[li].typed, resolution.idx); } catch (ae) { logToSheet("§14 alias save err: " + ae); }
-      }
-    }
-
-    // Format reply — echo canonical names (safety net §14.10) + flag unknown/ambiguous participants.
-    var payMode = parsedJson.payment_mode || "Unknown";
-    var reply = "📸 **Receipt Logged!**\n" +
-      "🏢 **Store:** " + parsedJson.description + " (" + parsedJson.category + ")\n" +
-      "📅 **Date:** " + parsedJson.date + "\n" +
-      "💳 **Mode:** " + payMode + "\n" +
-      "💰 **Total:** ₹" + parsedJson.total_amount.toFixed(2) + " paid by **" + parsedJson.payer + "**\n\n" +
-      "👥 **Split:**\n";
-
-    for (var i = 0; i < parsedJson.splits.length; i++) {
-      var sn = parsedJson.splits[i].name, tag = "";
-      if (resolution) {
-        for (var ui = 0; ui < resolution.unknown.length; ui++) if (resolution.unknown[ui] === sn) { tag = " _(new — set up in Notion)_"; break; }
-        if (!tag) for (var qi = 0; qi < resolution.ambiguous.length; qi++) if (resolution.ambiguous[qi].typed === sn) { tag = " _(ambiguous — pick below)_"; break; }
-      }
-      reply += "- " + sn + ": ₹" + parsedJson.splits[i].amount.toFixed(2) + tag + "\n";
-    }
-    reply += syncNote + sumWarn;
-
-    var replyMarkup = {
-      "inline_keyboard": [[
-        { "text": "🗑️ Delete", "callback_data": "delete_" + notionPageId }
-      ]]
-    };
-
-    sendTelegramMessage(token, chatId, reply, messageId, "Markdown", replyMarkup);
-
-    // D-ID1=A — ask about ambiguous names with inline candidate buttons.
-    if (cfg14 && resolution && resolution.ambiguous.length && notionPageId) {
-      sendDisambiguationButtons_(token, chatId, cfg14, notionPageId, resolution.ambiguous);
-    }
+    finalizeExpense_(parsedJson, ctx, {
+      kind: "photo", token: token, chatId: chatId, messageId: messageId, ownerName: ownerName,
+      tag: "📷 [processReceiptPhoto]", source: "Telegram Receipt Scanning",
+      auditText: "Receipt Photo" + (caption ? " (" + caption + ")" : ""), resendNoun: "receipt"
+    });
     logToSheet("📷 [processReceiptPhoto] Finished successfully.");
 
   } catch (err) {
@@ -1333,14 +1219,20 @@ function repointExpensePerson_(cfg, exp, fromPageId, toPageId, fromName, toName)
 // §14.9 Merge — a stray row (typed name) should be `real`: re-point its expenses, archive it, THEN save
 // the alias (order matters — saving before archive is rejected because the stray still claims the name).
 function mergeStrayPerson_(cfg, strayPageId, realPageId, realName, typedName) {
-  var cursor = null;
+  // Collect EVERY referencing expense before repointing any of them. repointExpensePerson_ drops the
+  // row out of this very filter, so mutating mid-pagination shifts the remaining rows past the cursor
+  // and silently skips them — and the stray is archived below regardless, which would leave those
+  // expenses pointing at an archived person with no retry. (Same collect-then-mutate rule as
+  // pollLinkExpenseGroups_.)
+  var rows = [], cursor = null;
   do {
     var body = { page_size: 50, filter: { property: "Participants", relation: { contains: strayPageId } } };
     if (cursor) body.start_cursor = cursor;
     var r = pollNotion_(cfg, "POST", "databases/" + cfg.db.expenses + "/query", body);
-    for (var i = 0; i < r.results.length; i++) repointExpensePerson_(cfg, r.results[i], strayPageId, realPageId, typedName, realName);
+    for (var i = 0; i < r.results.length; i++) rows.push(r.results[i]);
     cursor = r.has_more ? r.next_cursor : null;
   } while (cursor);
+  for (var j = 0; j < rows.length; j++) repointExpensePerson_(cfg, rows[j], strayPageId, realPageId, typedName, realName);
   pollNotion_(cfg, "PATCH", "pages/" + strayPageId, { archived: true });
   saveAlias_(cfg, realPageId, typedName);
 }
@@ -2088,42 +1980,47 @@ function mergeStrayIsRow_(rowPage, targetPage) {
 
 // §17 — process Merge Into: fold a stray person into the target (aliases + repoint expenses + archive).
 function pollProcessMerges_(cfg) {
-  var idName = pollPeopleIdName_(cfg), cursor = null, merged = 0;
+  var idName = pollPeopleIdName_(cfg), merged = 0;
+  // Collect the flagged rows before merging any of them — a merge archives its stray, which drops
+  // that row out of this filter and pushes the rows behind it past the cursor.
+  var flagged = [], cursor = null;
   do {
     var b = { page_size: 50, filter: { property: "Merge Into", relation: { is_not_empty: true } } };
     if (cursor) b.start_cursor = cursor;
     var r = pollNotion_(cfg, "POST", "databases/" + cfg.db.people + "/query", b);
-    for (var i = 0; i < r.results.length; i++) {
-      var row = r.results[i], rel = (row.properties["Merge Into"].relation) || [];
-      if (!rel.length || rel[0].id === row.id) continue;
-      var targetId = rel[0].id, strayName = pollRichText_(row.properties["Name"]);
-      // Follow chains (A→B while B→C is flagged in the same run): merge A straight into the
-      // final target, or PATCHing an already-archived intermediate would 400. Cycle-guarded.
-      var seenIds = {}; seenIds[row.id] = true;
-      var tpage = null;
-      for (var hop = 0; hop < 5; hop++) {
-        if (seenIds[targetId]) break;
-        seenIds[targetId] = true;
-        try { tpage = pollNotion_(cfg, "GET", "pages/" + targetId, null); } catch (tpe) { tpage = null; break; }
-        var trel = (tpage.properties["Merge Into"] && tpage.properties["Merge Into"].relation) || [];
-        if (!trel.length || trel[0].id === targetId || seenIds[trel[0].id]) break;
-        targetId = trel[0].id; tpage = null;   // advanced past this hop; re-fetch the new target
-      }
-      if (targetId === row.id) continue;   // chain looped back to the stray itself
-      if (!tpage) { try { tpage = pollNotion_(cfg, "GET", "pages/" + targetId, null); } catch (tpe2) { tpage = null; } }
-      // §18 — deterministic survivor selection (Notion mirrors the self-relation onto both rows).
-      if (!mergeStrayIsRow_(row, tpage)) {
-        logToSheet("§17 merge: skipped '" + strayName + "' — mutual pair; not archiving this side (set Primary Identity if these are two Splitwise accounts of one person)");
-        continue;
-      }
-      var strayAliases = pollRichText_(row.properties["Aliases"]);
-      mergeStrayPerson_(cfg, row.id, targetId, idName[targetId] || "", strayName);
-      if (strayAliases) { var av = strayAliases.split(","); for (var a = 0; a < av.length; a++) { var al = av[a].replace(/^\s+|\s+$/g, ""); if (al) saveAlias_(cfg, targetId, al); } }
-      merged++;
-      logToSheet("§17 merge: '" + strayName + "' -> '" + (idName[targetId] || targetId) + "'");
-    }
+    for (var fi = 0; fi < r.results.length; fi++) flagged.push(r.results[fi]);
     cursor = r.has_more ? r.next_cursor : null;
   } while (cursor);
+
+  for (var i = 0; i < flagged.length; i++) {
+    var row = flagged[i], rel = (row.properties["Merge Into"].relation) || [];
+    if (!rel.length || rel[0].id === row.id) continue;
+    var targetId = rel[0].id, strayName = pollRichText_(row.properties["Name"]);
+    // Follow chains (A→B while B→C is flagged in the same run): merge A straight into the
+    // final target, or PATCHing an already-archived intermediate would 400. Cycle-guarded.
+    var seenIds = {}; seenIds[row.id] = true;
+    var tpage = null;
+    for (var hop = 0; hop < 5; hop++) {
+      if (seenIds[targetId]) break;
+      seenIds[targetId] = true;
+      try { tpage = pollNotion_(cfg, "GET", "pages/" + targetId, null); } catch (tpe) { tpage = null; break; }
+      var trel = (tpage.properties["Merge Into"] && tpage.properties["Merge Into"].relation) || [];
+      if (!trel.length || trel[0].id === targetId || seenIds[trel[0].id]) break;
+      targetId = trel[0].id; tpage = null;   // advanced past this hop; re-fetch the new target
+    }
+    if (targetId === row.id) continue;   // chain looped back to the stray itself
+    if (!tpage) { try { tpage = pollNotion_(cfg, "GET", "pages/" + targetId, null); } catch (tpe2) { tpage = null; } }
+    // §18 — deterministic survivor selection (Notion mirrors the self-relation onto both rows).
+    if (!mergeStrayIsRow_(row, tpage)) {
+      logToSheet("§17 merge: skipped '" + strayName + "' — mutual pair; not archiving this side (set Primary Identity if these are two Splitwise accounts of one person)");
+      continue;
+    }
+    var strayAliases = pollRichText_(row.properties["Aliases"]);
+    mergeStrayPerson_(cfg, row.id, targetId, idName[targetId] || "", strayName);
+    if (strayAliases) { var av = strayAliases.split(","); for (var a = 0; a < av.length; a++) { var al = av[a].replace(/^\s+|\s+$/g, ""); if (al) saveAlias_(cfg, targetId, al); } }
+    merged++;
+    logToSheet("§17 merge: '" + strayName + "' -> '" + (idName[targetId] || targetId) + "'");
+  }
   return merged;
 }
 
@@ -2253,17 +2150,20 @@ function pollCatalogGroups_(cfg, groups) {
     for (var gidKey in existing) {
       if (aliveIds[gidKey]) continue;                       // still on Splitwise — keep it
       var deadPageId = existing[gidKey].id;
-      // unassign anyone routing through this group (Default Group is a relation to this page)
+      // unassign anyone routing through this group (Default Group is a relation to this page).
+      // Collect first, then patch — clearing the relation removes the row from this filter, so
+      // mutating mid-pagination would carry the cursor past the people behind it.
       try {
-        var pc = null;
+        var routed = [], pc = null;
         do {
           var pbody = { page_size: 100, filter: { property: "Default Group", relation: { contains: deadPageId } } };
           if (pc) pbody.start_cursor = pc;
           var pr = pollNotion_(cfg, "POST", "databases/" + cfg.db.people + "/query", pbody);
-          for (var pi = 0; pi < pr.results.length; pi++)
-            pollNotion_(cfg, "PATCH", "pages/" + pr.results[pi].id, { properties: { "Default Group": { relation: [] } } });
+          for (var pi = 0; pi < pr.results.length; pi++) routed.push(pr.results[pi].id);
           pc = pr.has_more ? pr.next_cursor : null;
         } while (pc);
+        for (var rp = 0; rp < routed.length; rp++)
+          pollNotion_(cfg, "PATCH", "pages/" + routed[rp], { properties: { "Default Group": { relation: [] } } });
       } catch (edg) { logToSheet("pollCatalogGroups_ prune: clearing Default Group for group " + gidKey + " failed: " + edg); }
       // archive the stale group row (skipped from Allowed queries once archived, so no further fetches)
       try {
@@ -2334,16 +2234,23 @@ function pollMarkSwidCreated_(swid) {
 }
 
 function pollFindExpense_(cfg, swid) {
-  var r = pollNotion_(cfg, "POST", "databases/" + cfg.db.expenses + "/query",
-    { filter: { property: "Splitwise ID", rich_text: { contains: String(swid) } } });
-  var want = String(swid);
-  var results = (r.results || []);
-  for (var i = 0; i < results.length; i++) {
-    var ids = pollRichText_(results[i].properties["Splitwise ID"]).split(",");
-    for (var j = 0; j < ids.length; j++) {
-      if (ids[j].replace(/^\s+|\s+$/g, "") === want) return results[i];
+  // Paginated: `contains` is a substring match, so a long-lived ledger can return more than one
+  // page of near-misses ("123" also matches "4123") with the genuine row sitting past page 1 —
+  // stopping at the first page would report "not found" and create a duplicate.
+  var want = String(swid), cursor = null;
+  do {
+    var body = { page_size: 100, filter: { property: "Splitwise ID", rich_text: { contains: want } } };
+    if (cursor) body.start_cursor = cursor;
+    var r = pollNotion_(cfg, "POST", "databases/" + cfg.db.expenses + "/query", body);
+    var results = (r.results || []);
+    for (var i = 0; i < results.length; i++) {
+      var ids = pollRichText_(results[i].properties["Splitwise ID"]).split(",");
+      for (var j = 0; j < ids.length; j++) {
+        if (ids[j].replace(/^\s+|\s+$/g, "") === want) return results[i];
+      }
     }
-  }
+    cursor = r.has_more ? r.next_cursor : null;
+  } while (cursor);
   return null;
 }
 
@@ -2484,6 +2391,11 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
     var existingIdsClean = [];
     for (var eic = 0; eic < existingIdsRaw.length; eic++) { var eit = existingIdsRaw[eic].replace(/^\s+|\s+$/g, ""); if (eit) existingIdsClean.push(eit); }
     if (existingIdsClean.length > 1) {
+      // A rebuild reads EVERY sub-expense live and stamps the newest sub's updated_at on the row. So
+      // any sub we re-see whose own updated_at predates that stamp was already captured by the last
+      // rebuild — skip it, instead of re-running N get_expense calls plus a PATCH on every cycle
+      // that happens to re-see an unchanged sibling.
+      if ((e.updated_at || "") < pollRichText_(page.properties["Splitwise Updated At"])) return "skip";
       var rebuiltU = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, existingIdsClean);
       if (!rebuiltU.liveSwids.length) { pollNotion_(cfg, "PATCH", "pages/" + page.id, { archived: true }); return "archive"; }
       var oldTotalU = (page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0;
@@ -2873,6 +2785,19 @@ function pollProcessSyncActions_(cfg, token, ownerName) {
       // Create the replacement FIRST, then delete the old expenses. If the new push parks,
       // nothing has been destroyed — the old Splitwise expenses stay live and the row keeps them.
       var parsed = pollReconstructExpense_(cfg, e, idName);
+      // owner-payer invariant, same as pollRetryNeedsMapping_: only the payer's instance may create
+      // the Splitwise expense. Without this, flagging Re-push on an IMPORTED row that somebody else
+      // paid would push a replacement with the OWNER as payer and then delete the original below —
+      // destroying the real payer's expense and inverting who owes whom.
+      if (normName_(parsed.payer) !== normName_(ownerName)) {
+        pollNotion_(cfg, "PATCH", "pages/" + e.id, { properties: {
+          "Sync Action": { select: { name: "None" } },
+          "Sync Status": { rich_text: rtChunks_("re-push refused — " + (parsed.payer || "someone else") +
+            " paid this, not you. Only the payer's IronBank may push it to Splitwise.") }
+        } });
+        logToSheet("re-push refused (payer is not the owner): '" + desc + "'");
+        continue;
+      }
       var res = executePushPlan_(cfg, token, parsed, ownerName, peopleRows);
       if (res.success) {
         for (var s2 = 0; s2 < swids.length; s2++) {
@@ -3112,9 +3037,18 @@ function recordExpense_(data, originalPrompt, source) {
 
 // §14 — read the live select options of an Expenses property (the Notion dashboard dropdown) so adding
 // an option in Notion flows straight to the parser. Skips junk/catch-all values ("null", ".", "unknown").
+// One execution asks for the Expenses schema up to four times per message (allowed categories +
+// payment modes, once for the Gemini prompt and again for the Notion write). Memoize the fetched
+// database object for the life of the execution — the schema cannot change mid-request.
+var NOTION_DB_SCHEMA_CACHE_ = {};
+
 function getNotionSelectOptions_(cfg, propName) {
   try {
-    var db = notionApi(cfg, "GET", "databases/" + cfg.db.expenses, null);
+    var db = NOTION_DB_SCHEMA_CACHE_[cfg.db.expenses];
+    if (!db) {
+      db = notionApi(cfg, "GET", "databases/" + cfg.db.expenses, null);
+      NOTION_DB_SCHEMA_CACHE_[cfg.db.expenses] = db;
+    }
     var prop = db.properties[propName];
     if (!prop || !prop.select || !prop.select.options) return [];
     var out = [];
