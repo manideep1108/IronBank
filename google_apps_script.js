@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.5.1";
+var IRONBANK_VERSION = "1.6.0";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -1295,7 +1295,7 @@ function checkSplitSum_(splits, total) {
 
 // Create the Expenses page + Payer relation + Participants + Splits Data. §14: also used as the sole
 // write path (R8 — Sheet no longer stores transactions). Amount = owner's share; Total = full cost.
-function writeToNotion(data, source, ownerName, splitsSummary) {
+function writeToNotion(data, source, ownerName, splitsSummary, originalPrompt) {
   var cfg = getNotionConfig();
   if (!cfg) return null;  // Notion not configured on this deployment — skip silently
 
@@ -1373,6 +1373,15 @@ function writeToNotion(data, source, ownerName, splitsSummary) {
   }
   props["Participants"] = { relation: participantIds };
   props["Splits Data"] = { rich_text: rtChunks_(JSON.stringify(splitsData)) };
+
+  // §21 — keep the message that produced this row verbatim (the Telegram text, or "Receipt Photo
+  // (caption)"). Description is a short label now, so without this the original wording is nowhere.
+  // OPTIONAL column, written only when the Expenses DB actually has it: Notion rejects the ENTIRE page
+  // write with a 400 if any property is unknown, so writing it unconditionally would break expense
+  // logging outright on installs whose schema predates the column.
+  if (originalPrompt && notionExpensesHasProp_(cfg, "Original Prompt")) {
+    props["Original Prompt"] = { rich_text: rtChunks_(String(originalPrompt)) };
+  }
 
   var expense = notionApi(cfg, "POST", "pages", {
     parent: { database_id: cfg.db.expenses },
@@ -3048,7 +3057,7 @@ function recordExpense_(data, originalPrompt, source) {
   }
   var splitsSummary = splitsSummaryParts.join(", ");
   try {
-    return writeToNotion(data, source || "Telegram", getOwnerName(), splitsSummary);
+    return writeToNotion(data, source || "Telegram", getOwnerName(), splitsSummary, originalPrompt);
   } catch (notionErr) {
     logToSheet("Notion write failed: " + notionErr);
     return null;
@@ -3066,13 +3075,31 @@ function recordExpense_(data, originalPrompt, source) {
 // database object for the life of the execution — the schema cannot change mid-request.
 var NOTION_DB_SCHEMA_CACHE_ = {};
 
+function notionExpensesSchema_(cfg) {
+  var db = NOTION_DB_SCHEMA_CACHE_[cfg.db.expenses];
+  if (!db) {
+    db = notionApi(cfg, "GET", "databases/" + cfg.db.expenses, null);
+    NOTION_DB_SCHEMA_CACHE_[cfg.db.expenses] = db;
+  }
+  return db;
+}
+
+// §21 — does the live Expenses schema carry this property? Shares the memoized database object, so it
+// costs no extra Notion round-trip. This is what lets an OPTIONAL column be written without breaking
+// installs that predate it; on any doubt it answers "no", because a wrong yes fails the whole write.
+function notionExpensesHasProp_(cfg, propName) {
+  try {
+    var db = notionExpensesSchema_(cfg);
+    return !!(db && db.properties && db.properties[propName]);
+  } catch (e) {
+    logToSheet("notionExpensesHasProp_(" + propName + ") schema read failed, skipping the column: " + e);
+    return false;
+  }
+}
+
 function getNotionSelectOptions_(cfg, propName) {
   try {
-    var db = NOTION_DB_SCHEMA_CACHE_[cfg.db.expenses];
-    if (!db) {
-      db = notionApi(cfg, "GET", "databases/" + cfg.db.expenses, null);
-      NOTION_DB_SCHEMA_CACHE_[cfg.db.expenses] = db;
-    }
+    var db = notionExpensesSchema_(cfg);
     var prop = db.properties[propName];
     if (!prop || !prop.select || !prop.select.options) return [];
     var out = [];

@@ -270,6 +270,10 @@ def schema_expenses(people_id, groups_id, categories, payment_modes):
             "Splits Summary": rt(),
             "Participants": rel(people_id),               # multi via relation
             "Splits Data": rt(),                          # JSON [{person, owed}]
+            "Original Prompt": rt(),                      # the message that created the row, verbatim
+                                                          # (Description is only a short label). Optional:
+                                                          # the script writes it only if it exists, so an
+                                                          # install that never re-runs onboarding is fine.
             "Settlement Status": sel("Settled-via-Splitwise", "Needs mapping", "Notion-only"),
             "Sync Action": sel("None", "Delete", "Re-push"),
             "Sync Status": rt()}
