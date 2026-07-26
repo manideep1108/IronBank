@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.5.0";
+var IRONBANK_VERSION = "1.5.1";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -716,6 +716,10 @@ function processExpenseText(text, geminiKey, token, chatId, messageId, ownerName
       "7. For fixed_splits: If any person's fixed split amount is given as a mathematical expression (e.g., '100+50'), evaluate the expression to a single numeric value (e.g., 150) before outputting it.\n" +
       expensePerItemRule_(ownerName, 8, "in the text",
         "G1: 100, G2: 200, G3: 300, G4: 400. Split G2 and G3 between A and I, and the rest between A, B, and I") +
+      // The whole input sentence is not a description. Gemini echoed it verbatim ("8355 for alcohol split
+      // equally between …, and I") despite the schema hint asking for a brief one, so the constraint is
+      // stated as a rule too — the message text is already kept in full on the row's audit field.
+      "9. Write the description as a SHORT label (2-4 words) naming WHAT was bought — 'Alcohol', 'Auto to office', 'Dinner'. Never copy the input sentence into it, and never put the amount, the split instructions, or participant names in it.\n" +
       "Text to parse:\n\"" + text + "\"";
 
     var url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + geminiKey;
@@ -724,7 +728,7 @@ function processExpenseText(text, geminiKey, token, chatId, messageId, ownerName
       "contents": [{
         "parts": [{ "text": prompt }]
       }],
-      "generationConfig": expenseGenerationConfig_(ctx, "Brief description of what it was for")
+      "generationConfig": expenseGenerationConfig_(ctx, "A SHORT label (2-4 words) for WHAT was bought, e.g. 'Alcohol', 'Auto to office', 'Dinner'. NEVER echo the input sentence back, and never include the amount, the split instructions, or participant names.")
     };
 
     var options = {
@@ -2265,7 +2269,9 @@ function pollFindExpense_(cfg, swid) {
 // redistributed unevenly or the user may have set custom uneven shares — so both cases come out
 // correct. Returns { props, liveSwids }; liveSwids drops any id that turned out already-deleted or
 // unreachable during the rebuild (a race between the trigger and this call).
-function pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, swids) {
+// `notionOwnerShare` = the row's CURRENT Amount, so a rebuild can carry the owner's Notion-only share
+// forward. See the §20c note below the loop for why that is necessary rather than merely nice.
+function pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, swids, notionOwnerShare) {
   var totalCost = 0, ownerShare = 0, latestUpdatedAt = "";
   var summaryParts = [], participantIds = [], splitsData = [], pseen = {};
   var liveSwids = [], liveGids = [];
@@ -2299,11 +2305,27 @@ function pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, p
       splitsData.push({ person: pname, owed: Math.round(owed * 100) / 100 });
     }
   }
+  // §20c — the owner's own share is deliberately NEVER pushed to Splitwise: pushGroupExpense_ zeroes the
+  // payer's owed_share and bills `cost` to the participants only, because you don't owe yourself. That
+  // share therefore exists in Notion ALONE. Rebuilding purely from Splitwise consequently reports an
+  // owner share of 0 and a total short by exactly that amount — which writes Amount ₹0 against a real
+  // expense and drops it out of /report, the same silent loss as an empty split list. When Splitwise
+  // assigns the owner nothing, carry the row's existing Amount forward and add it back to the total.
+  // A hand-edited sub-expense that DOES give the owner a share wins instead: ownerShare is then > 0 and
+  // already included in exp.cost, so nothing is carried and Splitwise stays authoritative.
+  var carried = (ownerShare === 0) ? (parseFloat(notionOwnerShare || 0) || 0) : 0;
+  if (carried > 0) {
+    var opage = pollUpsertPerson_(cfg, { id: ownerId }, ownerId, ownerName, idToName, personCache);
+    if (opage && !pseen[opage]) { participantIds.push({ id: opage }); pseen[opage] = true; }
+    summaryParts.push(ownerName + ": ₹" + carried.toFixed(2));
+    splitsData.push({ person: ownerName, owed: Math.round(carried * 100) / 100 });
+  }
+
   return {
     liveSwids: liveSwids,
     props: {
-      "Amount": { number: Math.round(ownerShare * 100) / 100 },
-      "Total Amount": { number: Math.round(totalCost * 100) / 100 },
+      "Amount": { number: Math.round((ownerShare + carried) * 100) / 100 },
+      "Total Amount": { number: Math.round((totalCost + carried) * 100) / 100 },
       "Participants": { relation: participantIds },
       "Splits Summary": { rich_text: rtChunks_(summaryParts.join(", ")) },
       "Splits Data": { rich_text: rtChunks_(JSON.stringify(splitsData)) },
@@ -2354,7 +2376,8 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
       var keepIds = [];
       for (var ki = 0; ki < idList.length; ki++) if (idList[ki] !== String(swid)) keepIds.push(idList[ki]);
       if (!keepIds.length) { pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { archived: true }); return "archive"; }
-      var rebuiltD = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, keepIds);
+      var rebuiltD = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, keepIds,
+        (dpage.properties["Amount"] && dpage.properties["Amount"].number) || 0);
       if (!rebuiltD.liveSwids.length) { pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { archived: true }); return "archive"; }
       var oldTotalD = (dpage.properties["Total Amount"] && dpage.properties["Total Amount"].number) || 0;
       var droppedNamesD = [], eusersD = e.users || [];
@@ -2396,7 +2419,8 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
       // rebuild — skip it, instead of re-running N get_expense calls plus a PATCH on every cycle
       // that happens to re-see an unchanged sibling.
       if ((e.updated_at || "") < pollRichText_(page.properties["Splitwise Updated At"])) return "skip";
-      var rebuiltU = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, existingIdsClean);
+      var rebuiltU = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, existingIdsClean,
+        (page.properties["Amount"] && page.properties["Amount"].number) || 0);
       if (!rebuiltU.liveSwids.length) { pollNotion_(cfg, "PATCH", "pages/" + page.id, { archived: true }); return "archive"; }
       var oldTotalU = (page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0;
       pollFlagCompositeDrop_(rebuiltU.props, oldTotalU, null);
