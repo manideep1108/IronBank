@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.9.0";
+var IRONBANK_VERSION = "1.9.1";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -2592,7 +2592,12 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
   if (page) {
     var prevAmount = parseFloat((page.properties["Amount"] && page.properties["Amount"].number) || 0) || 0;
     var prevBill = parseFloat((page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0) || 0;
-    pollFlagShareAbsorbed_(props, prevAmount, null);
+    // Only flag the absorb when WE inferred it. A single-group expense carrying the owner's share
+    // (1.8.0+) rebalances inside Splitwise: it states outright that the owner now owes ₹134, Notion
+    // copies that, and there is no judgement to review — flagging it would fill the queue with
+    // entries whose only resolution is to clear them, which is how a review queue stops being read.
+    // When Splitwise reports the owner nothing, the share came from OUR arithmetic, so it is flagged.
+    if (ownerShare === 0) pollFlagShareAbsorbed_(props, prevAmount, null);
     if (ownerShare === 0 && cost > prevBill + 0.5) {
       addReview_(props, REVIEW_OVER_BILL, "the shares on Splitwise now total ₹" + cost.toFixed(2) +
         ", more than the ₹" + prevBill.toFixed(2) + " bill recorded here. The bill has been raised to ₹" +
