@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.7.0";
+var IRONBANK_VERSION = "1.8.0";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -1490,10 +1490,13 @@ function resolvePushPlanForParticipants_(cfg, parsed, ownerName, peopleRows) {
     }
   }
 
-  var byGroup = {}, splits = parsed.splits || [];
+  var byGroup = {}, splits = parsed.splits || [], ownerShare = 0;
   for (var s = 0; s < splits.length; s++) {
     var nml = (splits[s].name || "").toString().toLowerCase().replace(/^\s+|\s+$/g, "");
-    if (NOTION_OWNER_ALIASES[nml] === 1 || nml === ownerLower) continue; // owner share stays Notion-only
+    // §22 — the owner's share is collected, not discarded. It is never a routed participant (you do
+    // not owe yourself), but a single-bucket push can carry it as the payer's own owed_share so the
+    // Splitwise expense states the WHOLE bill. See executePushPlan_ for why only single-bucket.
+    if (NOTION_OWNER_ALIASES[nml] === 1 || nml === ownerLower) { ownerShare += parseFloat(splits[s].amount || 0) || 0; continue; }
     if (collidingKey[nml]) return { park: "'" + splits[s].name + "' matches more than one person in Notion (duplicate name/alias) — fix Aliases or use Merge Into" };
     var r = routing[nml];
     if (!r || !r.swid) return { park: "'" + splits[s].name + "' not resolved (no Splitwise ID)" };
@@ -1504,20 +1507,26 @@ function resolvePushPlanForParticipants_(cfg, parsed, ownerName, peopleRows) {
   var groups = [];
   for (var k in byGroup) groups.push({ gid: parseInt(k, 10), participants: byGroup[k] });
   if (!groups.length) return { park: "no non-owner participants (solo → Notion-only)" };
-  return { groups: groups };
+  return { groups: groups, ownerShare: Math.round(ownerShare * 100) / 100 };
 }
 
-// §13b/§17 — create one Splitwise expense: owner is payer (owed 0), participants owe shares.
+// §13b/§17 — create one Splitwise expense: the owner is the payer, participants owe their shares.
 // gid 0/null → a non-group (direct friend) expense (group_id omitted).
-function pushGroupExpense_(token, ownerId, gid, participants, description, date) {
-  var cost = 0;
+// §22 — `ownerShare` (optional, default 0) is the payer's OWN share of the bill. Including it makes
+// `cost` the whole bill instead of just what the others owe, which is what lets Splitwise hold the
+// complete record. It is balance-neutral: Splitwise nets paid − owed, and (cost − ownerShare) is the
+// participants' sum either way, so what everyone owes the payer is unchanged.
+function pushGroupExpense_(token, ownerId, gid, participants, description, date, ownerShare) {
+  var own = parseFloat(ownerShare || 0) || 0;
+  if (own < 0) own = 0;
+  var cost = own;
   for (var i = 0; i < participants.length; i++) cost += participants[i].amount;
   var payload = { cost: cost.toFixed(2), description: description, currency_code: "INR" };
   if (gid) payload["group_id"] = String(gid);
   if (date) payload["date"] = date;
   payload["users__0__user_id"] = String(ownerId);
   payload["users__0__paid_share"] = cost.toFixed(2);
-  payload["users__0__owed_share"] = "0.00";
+  payload["users__0__owed_share"] = own.toFixed(2);
   for (var j = 0; j < participants.length; j++) {
     payload["users__" + (j + 1) + "__user_id"] = String(participants[j].swid);
     payload["users__" + (j + 1) + "__paid_share"] = "0.00";
@@ -1542,9 +1551,16 @@ function executePushPlan_(cfg, token, parsed, ownerName, peopleRows) {
   var ownerId = parseInt(scriptProps.getProperty("POLL_OWNER_ID") || "0", 10);
   if (!ownerId) { ownerId = swGet_(token, "get_current_user").user.id; scriptProps.setProperty("POLL_OWNER_ID", String(ownerId)); }
   var ids = [], gids = [], created = [], upds = [];
+  // §22 — carry the owner's own share into the Splitwise expense ONLY when the whole push lands in one
+  // bucket. Then Splitwise states the entire bill, the sync mirrors it instead of reconstructing it,
+  // and the §20c absorb rule never has to run for this row. A fan-out cannot do this honestly: the
+  // owner's share would have to be split across several groups by some arbitrary rule, inflating each
+  // group's total with money that has nothing to do with the people in it — visible to THEM, to fix a
+  // bookkeeping detail of ours. Multi-group pushes therefore keep the owner's share Notion-only.
+  var planOwnerShare = (plan.groups.length === 1) ? (parseFloat(plan.ownerShare || 0) || 0) : 0;
   for (var i = 0; i < plan.groups.length; i++) {
     var gp = plan.groups[i];
-    var res = pushGroupExpense_(token, ownerId, gp.gid, gp.participants, parsed.description, (parsed.date || "").toString().substring(0, 10));
+    var res = pushGroupExpense_(token, ownerId, gp.gid, gp.participants, parsed.description, (parsed.date || "").toString().substring(0, 10), planOwnerShare);
     if (!res.success) {
       for (var d = 0; d < created.length; d++) {
         if (!swDeleteExpense_(token, created[d])) logToSheet("executePushPlan_: rollback delete FAILED for " + created[d] + " — remove it in Splitwise manually");
