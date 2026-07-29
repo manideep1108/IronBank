@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.9.3";
+var IRONBANK_VERSION = "1.10.0";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -2475,8 +2475,25 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
       pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { properties: rebuiltD.props });
       return "update";
     }
-    return pollConvertToNotionOnly_(cfg, dpage,
-      "The Splitwise expense was deleted.");
+    // §24 — WHO PAID decides what a deletion means, not what the record happened to contain.
+    // Owner paid: the money left their pocket at the shop, and nothing done on Splitwise undoes
+    // that — the record only ever tracked who owed them for it. Keep the row and flag.
+    // Somebody else paid: this was never the owner's spending, it was a debt to that person. Them
+    // retiring the record retires the debt, and the row goes with it.
+    // Composites need no special case here: IronBank only ever pushes what the owner paid, so they
+    // always take the first branch.
+    var delPayerId = null;
+    for (var doi = 0; doi < users.length; doi++) {
+      var du = users[doi], duid = du.user_id || (du.user && du.user.id);
+      if (delPayerId === null && parseFloat(du.paid_share || 0) > 0) delPayerId = duid;
+    }
+    if (delPayerId !== null && delPayerId !== ownerId) {
+      pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { archived: true });
+      logToSheet("deleted on Splitwise by its payer (" + (idToName[delPayerId] || delPayerId) +
+        ", not you) — archived: '" + desc + "'");
+      return "archive";
+    }
+    return pollConvertToNotionOnly_(cfg, dpage, "The Splitwise expense was deleted, but you paid this bill.");
   }
   if (uids.indexOf(ownerId) < 0) return "skip";                  // owner not a participant — not our activity
 
