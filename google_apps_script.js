@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.8.0";
+var IRONBANK_VERSION = "1.9.0";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -2373,13 +2373,67 @@ function pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, p
 // was already settled outside Splitwise. Only fires on a real drop; a same-cost redistribution among
 // fewer people (someone removed from an equal split, the rest absorb it) keeps the total unchanged
 // and is left alone.
-function pollFlagCompositeDrop_(props, oldTotal, droppedNames) {
-  var newTotal = props["Total Amount"].number;
-  if (newTotal >= oldTotal - 0.5) return;
-  var msg = "⚠️ Total dropped ₹" + oldTotal.toFixed(2) + " → ₹" + newTotal.toFixed(2) +
-    (droppedNames && droppedNames.length ? " (" + droppedNames.join(", ") + ")" : "") +
-    ". Verify this was settled outside Splitwise, or add the missing share elsewhere.";
-  props["Sync Status"] = { rich_text: rtChunks_(msg) };
+// §23 — REVIEW FLAGS. Two things the sync must never do quietly: remove a row, or move money onto the
+// owner. Where it previously did either, it now records what happened here and leaves the row in place
+// for a human. The note is "⚠️ [Reason] detail", so a Notion view filters by reason with
+// `Sync Status contains "[Share absorbed]"` — categories without an extra column, which also means
+// every install gets this immediately with no onboarding re-run.
+var REVIEW_DELETED = "Deleted on Splitwise";
+var REVIEW_ABSORBED = "Share absorbed";
+var REVIEW_BILL_REPLACED = "Bill replaced";
+var REVIEW_OVER_BILL = "Shares exceed bill";
+var REVIEW_RENAMED = "Renamed on Splitwise";
+
+// Append rather than assign: one sync can legitimately raise two flags on the same row (a share
+// absorbed AND the bill replaced), and silently dropping one of them is the habit this whole section
+// exists to break.
+function addReview_(props, reason, detail) {
+  var note = "⚠️ [" + reason + "] " + detail;
+  var prev = props["Sync Status"] ? pollRichText_(props["Sync Status"]) : "";
+  props["Sync Status"] = { rich_text: rtChunks_(prev ? prev + "  |  " + note : note) };
+}
+
+// Replaces §20b's "Total dropped" warning, which 1.7.0 made unreachable by holding the bill fixed.
+// Under a fixed bill the money never leaves the row — it lands on the payer — so the event worth
+// surfacing is the owner's share GROWING because somebody else's shrank or vanished.
+function pollFlagShareAbsorbed_(props, oldAmount, droppedNames) {
+  var newAmount = props["Amount"].number;
+  if (!(newAmount > oldAmount + 0.5)) return;   // real increases only; rounding noise stays quiet
+  addReview_(props, REVIEW_ABSORBED,
+    (droppedNames && droppedNames.length ? droppedNames.join(", ") + " came off this expense" :
+     "someone reduced or removed their share") +
+    ", so yours grew ₹" + oldAmount.toFixed(2) + " → ₹" + newAmount.toFixed(2) +
+    " on an unchanged ₹" + props["Total Amount"].number.toFixed(2) +
+    " bill. Confirm it was settled outside Splitwise, or correct the shares there.");
+}
+
+// §23 — a row whose Splitwise side is gone. NEVER archive: for an expense we pushed, the Splitwise
+// record only ever held WHAT OTHERS OWED, so deleting it does not undo the owner's own spending —
+// archiving would erase a real ₹299 from /report on someone else's action. Keep the bill, hand the
+// whole thing to the owner (nobody is covering it now), drop the dead ids, and flag for review.
+function pollConvertToNotionOnly_(cfg, page, ownerId, ownerName, idToName, personCache, why) {
+  var bill = (page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0;
+  var prev = (page.properties["Amount"] && page.properties["Amount"].number) || 0;
+  var bill2 = Math.round(bill * 100) / 100;
+  var props = {
+    "Amount": { number: bill2 },
+    "Total Amount": { number: bill2 },
+    "Settlement Status": { select: { name: "Notion-only" } },
+    "Splitwise ID": { rich_text: [] },
+    "Splitwise Group ID": { rich_text: [] },
+    "Splitwise Updated At": { rich_text: [] },
+    "Splits Summary": { rich_text: rtChunks_(ownerName + ": ₹" + bill2.toFixed(2)) },
+    "Splits Data": { rich_text: rtChunks_(JSON.stringify([{ person: ownerName, owed: bill2 }])) }
+  };
+  try {
+    var opage = pollUpsertPerson_(cfg, { id: ownerId }, ownerId, ownerName, idToName, personCache);
+    if (opage) props["Participants"] = { relation: [{ id: opage }] };
+  } catch (oe) { logToSheet("pollConvertToNotionOnly_: owner person lookup failed: " + oe); }
+  addReview_(props, REVIEW_DELETED, why + " Nobody is covering it now, so your share went ₹" +
+    prev.toFixed(2) + " → ₹" + bill2.toFixed(2) + " (the whole bill). Set Sync Action = Delete if the " +
+    "expense is genuinely void, or Re-push to recreate it on Splitwise.");
+  pollNotion_(cfg, "PATCH", "pages/" + page.id, { properties: props });
+  return "update";
 }
 
 // Upsert one Splitwise expense into Notion. Returns "create" | "update" | "archive" | "skip".
@@ -2404,24 +2458,25 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
       // sub-expenses' actual owed_share values, rather than only trimming the id list — the row
       // no longer describes the just-deleted person's share once this returns. Archiving the whole
       // row here would still orphan the still-live expenses, so it only happens if none remain live.
-      var keepIds = [];
-      for (var ki = 0; ki < idList.length; ki++) if (idList[ki] !== String(swid)) keepIds.push(idList[ki]);
-      if (!keepIds.length) { pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { archived: true }); return "archive"; }
-      var rebuiltD = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, keepIds,
-        (dpage.properties["Total Amount"] && dpage.properties["Total Amount"].number) || 0);
-      if (!rebuiltD.liveSwids.length) { pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { archived: true }); return "archive"; }
-      var oldTotalD = (dpage.properties["Total Amount"] && dpage.properties["Total Amount"].number) || 0;
       var droppedNamesD = [], eusersD = e.users || [];
       for (var wd = 0; wd < eusersD.length; wd++) {
         var wu = eusersD[wd], wuid = wu.user_id || (wu.user && wu.user.id), wowed = parseFloat(wu.owed_share || 0);
         if (wuid !== ownerId && wowed > 0) droppedNamesD.push((idToName[wuid] || ("User " + wuid)) + ": ₹" + wowed.toFixed(2));
       }
-      pollFlagCompositeDrop_(rebuiltD.props, oldTotalD, droppedNamesD);
+      var keepIds = [];
+      for (var ki = 0; ki < idList.length; ki++) if (idList[ki] !== String(swid)) keepIds.push(idList[ki]);
+      if (!keepIds.length) return pollConvertToNotionOnly_(cfg, dpage, ownerId, ownerName, idToName, personCache,
+        "The last linked Splitwise expense was deleted.");
+      var rebuiltD = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, keepIds,
+        (dpage.properties["Total Amount"] && dpage.properties["Total Amount"].number) || 0);
+      if (!rebuiltD.liveSwids.length) return pollConvertToNotionOnly_(cfg, dpage, ownerId, ownerName, idToName, personCache,
+        "Every linked Splitwise expense is gone.");
+      pollFlagShareAbsorbed_(rebuiltD.props, (dpage.properties["Amount"] && dpage.properties["Amount"].number) || 0, droppedNamesD);
       pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { properties: rebuiltD.props });
       return "update";
     }
-    pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { archived: true });
-    return "archive";
+    return pollConvertToNotionOnly_(cfg, dpage, ownerId, ownerName, idToName, personCache,
+      "The Splitwise expense was deleted.");
   }
   if (uids.indexOf(ownerId) < 0) return "skip";                  // owner not a participant — not our activity
 
@@ -2452,9 +2507,15 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
       if ((e.updated_at || "") < pollRichText_(page.properties["Splitwise Updated At"])) return "skip";
       var rebuiltU = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, existingIdsClean,
         (page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0);
-      if (!rebuiltU.liveSwids.length) { pollNotion_(cfg, "PATCH", "pages/" + page.id, { archived: true }); return "archive"; }
-      var oldTotalU = (page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0;
-      pollFlagCompositeDrop_(rebuiltU.props, oldTotalU, null);
+      if (!rebuiltU.liveSwids.length) return pollConvertToNotionOnly_(cfg, page, ownerId, ownerName, idToName, personCache,
+        "Every linked Splitwise expense is gone.");
+      pollFlagShareAbsorbed_(rebuiltU.props, (page.properties["Amount"] && page.properties["Amount"].number) || 0, null);
+      // §23/E9 — a composite row keeps its Notion description (several sub-expenses, several possible
+      // names), so a rename on Splitwise is deliberately not applied. Say so rather than ignoring it.
+      if (desc && desc !== pollRichText_(page.properties["Description"])) {
+        addReview_(rebuiltU.props, REVIEW_RENAMED, "a linked Splitwise expense is now called \"" + desc +
+          "\". This row spans several Splitwise expenses so it keeps its own description — rename it here if you want it changed.");
+      }
       pollNotion_(cfg, "PATCH", "pages/" + page.id, { properties: rebuiltU.props });
       return "update";
     }
@@ -2523,6 +2584,26 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
   props["Splits Data"] = { rich_text: rtChunks_(JSON.stringify(splitsData)) };
   var payerPage = payerId ? pollUpsertPerson_(cfg, memberById[payerId] || { id: payerId }, ownerId, ownerName, idToName, personCache) : null;
   if (payerPage) props["Payer"] = { relation: [{ id: payerPage }] };
+
+  // §23 — surface anything that moved money onto the owner or changed the bill under them. All of
+  // these APPLY the change (the row must stay arithmetically consistent and match Splitwise); the
+  // flags exist so none of it happens invisibly. They fire on the transition, not the state: an
+  // unchanged expense is skipped upstream, so clearing a flag by hand makes it stay cleared.
+  if (page) {
+    var prevAmount = parseFloat((page.properties["Amount"] && page.properties["Amount"].number) || 0) || 0;
+    var prevBill = parseFloat((page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0) || 0;
+    pollFlagShareAbsorbed_(props, prevAmount, null);
+    if (ownerShare === 0 && cost > prevBill + 0.5) {
+      addReview_(props, REVIEW_OVER_BILL, "the shares on Splitwise now total ₹" + cost.toFixed(2) +
+        ", more than the ₹" + prevBill.toFixed(2) + " bill recorded here. The bill has been raised to ₹" +
+        cost.toFixed(2) + " and your share set to ₹0.00 — check the receipt total, or the edited share.");
+    }
+    if (ownerShare > 0 && prevBill > 0 && Math.abs(cost - prevBill) > 0.5) {
+      addReview_(props, REVIEW_BILL_REPLACED, "Splitwise now states this expense in full — total ₹" +
+        cost.toFixed(2) + " with your share ₹" + ownerShare.toFixed(2) + " — and it has replaced the ₹" +
+        prevBill.toFixed(2) + " bill recorded here. Verify which is right; Re-push restores the Notion figures.");
+    }
+  }
 
   // §15: single page write per expense — Participants + Splits Data replace the per-person Splits rows.
   if (page) {
