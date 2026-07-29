@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.9.1";
+var IRONBANK_VERSION = "1.9.2";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -2511,10 +2511,15 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
         "Every linked Splitwise expense is gone.");
       pollFlagShareAbsorbed_(rebuiltU.props, (page.properties["Amount"] && page.properties["Amount"].number) || 0, null);
       // §23/E9 — a composite row keeps its Notion description (several sub-expenses, several possible
-      // names), so a rename on Splitwise is deliberately not applied. Say so rather than ignoring it.
-      if (desc && desc !== pollRichText_(page.properties["Description"])) {
-        addReview_(rebuiltU.props, REVIEW_RENAMED, "a linked Splitwise expense is now called \"" + desc +
-          "\". This row spans several Splitwise expenses so it keeps its own description — rename it here if you want it changed.");
+      // names), so a rename on Splitwise is deliberately not applied. Say so rather than ignoring it —
+      // but at most once. The test can only compare the two CURRENT names, not detect a change, so a
+      // row whose Notion description was deliberately renamed (say "Alcohol" over the original
+      // sentence) differs permanently and would re-raise this on every sub-expense change, appending
+      // forever. Raise it only while the row isn't already carrying the tag; clearing it re-arms.
+      if (desc && desc !== pollRichText_(page.properties["Description"]) &&
+          pollRichText_(page.properties["Sync Status"]).indexOf("[" + REVIEW_RENAMED + "]") < 0) {
+        addReview_(rebuiltU.props, REVIEW_RENAMED, "a linked Splitwise expense is called \"" + desc +
+          "\", which differs from this row's name. A row spanning several Splitwise expenses keeps its own description — rename it here if you want it changed.");
       }
       pollNotion_(cfg, "PATCH", "pages/" + page.id, { properties: rebuiltU.props });
       return "update";
