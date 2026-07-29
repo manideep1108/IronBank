@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.6.1";
+var IRONBANK_VERSION = "1.7.0";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -2278,9 +2278,10 @@ function pollFindExpense_(cfg, swid) {
 // redistributed unevenly or the user may have set custom uneven shares — so both cases come out
 // correct. Returns { props, liveSwids }; liveSwids drops any id that turned out already-deleted or
 // unreachable during the rebuild (a race between the trigger and this call).
-// `notionOwnerShare` = the row's CURRENT Amount, so a rebuild can carry the owner's Notion-only share
-// forward. See the §20c note below the loop for why that is necessary rather than merely nice.
-function pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, swids, notionOwnerShare) {
+// `notionTotal` = the row's CURRENT Total Amount, i.e. the real bill as recorded when it was logged.
+// See the §20c note below the loop for why the owner's share is derived from that rather than read
+// back off Splitwise.
+function pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, swids, notionTotal) {
   var totalCost = 0, ownerShare = 0, latestUpdatedAt = "";
   var summaryParts = [], participantIds = [], splitsData = [], pseen = {};
   var liveSwids = [], liveGids = [];
@@ -2322,19 +2323,24 @@ function pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, p
   // assigns the owner nothing, carry the row's existing Amount forward and add it back to the total.
   // A hand-edited sub-expense that DOES give the owner a share wins instead: ownerShare is then > 0 and
   // already included in exp.cost, so nothing is carried and Splitwise stays authoritative.
-  var carried = (ownerShare === 0) ? (parseFloat(notionOwnerShare || 0) || 0) : 0;
+  var billTotal = totalCost, carried = 0;
+  if (ownerShare === 0) {
+    var prevTotal = parseFloat(notionTotal || 0) || 0;
+    billTotal = Math.max(prevTotal, totalCost);
+    carried = Math.round((billTotal - totalCost) * 100) / 100;
+  }
   if (carried > 0) {
     var opage = pollUpsertPerson_(cfg, { id: ownerId }, ownerId, ownerName, idToName, personCache);
     if (opage && !pseen[opage]) { participantIds.push({ id: opage }); pseen[opage] = true; }
     summaryParts.push(ownerName + ": ₹" + carried.toFixed(2));
-    splitsData.push({ person: ownerName, owed: Math.round(carried * 100) / 100 });
+    splitsData.push({ person: ownerName, owed: carried });
   }
 
   return {
     liveSwids: liveSwids,
     props: {
       "Amount": { number: Math.round((ownerShare + carried) * 100) / 100 },
-      "Total Amount": { number: Math.round((totalCost + carried) * 100) / 100 },
+      "Total Amount": { number: Math.round(billTotal * 100) / 100 },
       "Participants": { relation: participantIds },
       "Splits Summary": { rich_text: rtChunks_(summaryParts.join(", ")) },
       "Splits Data": { rich_text: rtChunks_(JSON.stringify(splitsData)) },
@@ -2386,7 +2392,7 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
       for (var ki = 0; ki < idList.length; ki++) if (idList[ki] !== String(swid)) keepIds.push(idList[ki]);
       if (!keepIds.length) { pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { archived: true }); return "archive"; }
       var rebuiltD = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, keepIds,
-        (dpage.properties["Amount"] && dpage.properties["Amount"].number) || 0);
+        (dpage.properties["Total Amount"] && dpage.properties["Total Amount"].number) || 0);
       if (!rebuiltD.liveSwids.length) { pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { archived: true }); return "archive"; }
       var oldTotalD = (dpage.properties["Total Amount"] && dpage.properties["Total Amount"].number) || 0;
       var droppedNamesD = [], eusersD = e.users || [];
@@ -2429,7 +2435,7 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
       // that happens to re-see an unchanged sibling.
       if ((e.updated_at || "") < pollRichText_(page.properties["Splitwise Updated At"])) return "skip";
       var rebuiltU = pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, existingIdsClean,
-        (page.properties["Amount"] && page.properties["Amount"].number) || 0);
+        (page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0);
       if (!rebuiltU.liveSwids.length) { pollNotion_(cfg, "PATCH", "pages/" + page.id, { archived: true }); return "archive"; }
       var oldTotalU = (page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0;
       pollFlagCompositeDrop_(rebuiltU.props, oldTotalU, null);
@@ -2465,26 +2471,31 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
     splitsData.push({ person: pname, owed: Math.round(owed * 100) / 100 });
   }
 
-  // §20c — the SAME carry-forward pollRebuildCompositeFields_ does, for the single-expense path. A push
-  // to one group is not a composite row, so it never reaches that function, yet it has the identical
-  // shape: pushGroupExpense_ zeroed the owner's owed_share and billed `cost` to the participants only,
-  // so the owner's share lives in Notion alone. Any later edit on Splitwise bumps updated_at, this path
-  // runs, and rebuilding from Splitwise would report ownerShare 0 and a total short by exactly that
-  // amount. Only on the UPDATE path — a fresh import has no Notion share to preserve, and `page` is
-  // null there, so a created row still takes Splitwise as the whole truth.
-  var carriedOwner = (ownerShare === 0 && page)
-    ? (parseFloat((page.properties["Amount"] && page.properties["Amount"].number) || 0) || 0) : 0;
-  if (carriedOwner > 0) {
+  // §20c — Total Amount is the REAL bill and does NOT move because a participant edited their share:
+  // the receipt was ₹299 whether Mangalik owes ₹217 or ₹165. For an expense we pushed, Splitwise holds
+  // only the OTHERS' shares (pushGroupExpense_ zeroes the payer's owed_share and bills `cost` to the
+  // participants), so the owner's share is simply what the bill leaves over — RECOMPUTE it rather than
+  // carrying the stale number. Someone lowering their share moves that money ONTO the payer; it does
+  // not leave the expense. UPDATE path only (`page`): a fresh import has no recorded bill, and there
+  // Splitwise's cost IS the whole bill. If the others now exceed the recorded bill, the bill itself
+  // must have grown, so believe Splitwise and let the owner's share fall to zero rather than negative.
+  var billTotal = cost, ownerAbsorbed = 0;
+  if (ownerShare === 0 && page) {
+    var prevTotal = parseFloat((page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0) || 0;
+    billTotal = Math.max(prevTotal, cost);
+    ownerAbsorbed = Math.round((billTotal - cost) * 100) / 100;
+  }
+  if (ownerAbsorbed > 0) {
     var ownPage = pollUpsertPerson_(cfg, { id: ownerId }, ownerId, ownerName, idToName, personCache);
     if (ownPage && !pseen[ownPage]) { participantIds.push({ id: ownPage }); pseen[ownPage] = true; }
-    summaryParts.push(ownerName + ": ₹" + carriedOwner.toFixed(2));
-    splitsData.push({ person: ownerName, owed: Math.round(carriedOwner * 100) / 100 });
+    summaryParts.push(ownerName + ": ₹" + ownerAbsorbed.toFixed(2));
+    splitsData.push({ person: ownerName, owed: ownerAbsorbed });
   }
 
   var props = {
     "Description": { title: [{ text: { content: desc } }] },
-    "Amount": { number: Math.round((ownerShare + carriedOwner) * 100) / 100 },
-    "Total Amount": { number: Math.round((cost + carriedOwner) * 100) / 100 },
+    "Amount": { number: Math.round((ownerShare + ownerAbsorbed) * 100) / 100 },
+    "Total Amount": { number: Math.round(billTotal * 100) / 100 },
     "Settlement Status": { select: { name: "Settled-via-Splitwise" } },
     "Splits Summary": { rich_text: rtChunks_(summaryParts.join(", ")) },
     "Splitwise ID": { rich_text: [{ text: { content: String(swid) } }] },
