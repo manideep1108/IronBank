@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.6.0";
+var IRONBANK_VERSION = "1.6.1";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -2465,10 +2465,26 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
     splitsData.push({ person: pname, owed: Math.round(owed * 100) / 100 });
   }
 
+  // §20c — the SAME carry-forward pollRebuildCompositeFields_ does, for the single-expense path. A push
+  // to one group is not a composite row, so it never reaches that function, yet it has the identical
+  // shape: pushGroupExpense_ zeroed the owner's owed_share and billed `cost` to the participants only,
+  // so the owner's share lives in Notion alone. Any later edit on Splitwise bumps updated_at, this path
+  // runs, and rebuilding from Splitwise would report ownerShare 0 and a total short by exactly that
+  // amount. Only on the UPDATE path — a fresh import has no Notion share to preserve, and `page` is
+  // null there, so a created row still takes Splitwise as the whole truth.
+  var carriedOwner = (ownerShare === 0 && page)
+    ? (parseFloat((page.properties["Amount"] && page.properties["Amount"].number) || 0) || 0) : 0;
+  if (carriedOwner > 0) {
+    var ownPage = pollUpsertPerson_(cfg, { id: ownerId }, ownerId, ownerName, idToName, personCache);
+    if (ownPage && !pseen[ownPage]) { participantIds.push({ id: ownPage }); pseen[ownPage] = true; }
+    summaryParts.push(ownerName + ": ₹" + carriedOwner.toFixed(2));
+    splitsData.push({ person: ownerName, owed: Math.round(carriedOwner * 100) / 100 });
+  }
+
   var props = {
     "Description": { title: [{ text: { content: desc } }] },
-    "Amount": { number: Math.round(ownerShare * 100) / 100 },
-    "Total Amount": { number: Math.round(cost * 100) / 100 },
+    "Amount": { number: Math.round((ownerShare + carriedOwner) * 100) / 100 },
+    "Total Amount": { number: Math.round((cost + carriedOwner) * 100) / 100 },
     "Settlement Status": { select: { name: "Settled-via-Splitwise" } },
     "Splits Summary": { rich_text: rtChunks_(summaryParts.join(", ")) },
     "Splitwise ID": { rich_text: [{ text: { content: String(swid) } }] },
