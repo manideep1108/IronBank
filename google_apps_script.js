@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.11.0";
+var IRONBANK_VERSION = "1.12.0";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -284,6 +284,10 @@ function doPost(e) {
               answerCallbackQuery(token, callbackId, "✅ '" + pCtx.typed + "' → " + (chosen ? chosen.canonical : "?"));
               editTelegramMessage(token, chatId, messageId, "✅ *'" + pCtx.typed + "'* → *" + (chosen ? chosen.canonical : "?") + "* saved. " + pickNote);
             }
+            return HtmlService.createHtmlOutput("OK");
+          } else if (data && data.indexOf("ib:") === 0) {
+            // §28 — buttons on /setgroup, /unmapped and /flags.
+            handleIbCallback_(token, chatId, messageId, callbackId, data);
             return HtmlService.createHtmlOutput("OK");
           } else if (data && data.indexOf("retry_") === 0) {
             var retryId = data.replace("retry_", "");
@@ -736,7 +740,7 @@ function processExpenseText(text, geminiKey, token, chatId, messageId, ownerName
       "9. Write the description as a SHORT label (2-4 words) naming WHAT was bought — 'Alcohol', 'Auto to office', 'Dinner'. Never copy the input sentence into it, and never put the amount, the split instructions, or participant names in it.\n" +
       "Text to parse:\n\"" + text + "\"";
 
-    var url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + geminiKey;
+    var url = geminiUrl_(geminiKey);
 
     var payload = {
       "contents": [{
@@ -843,8 +847,8 @@ function processReceiptPhoto(photoArray, caption, geminiKey, token, chatId, mess
       expensePerItemRule_(ownerName, 8, "on the receipt/invoice, grouped as the caption specifies",
         "item 1 split between A and B, rest split between A, B, and me");
 
-    var url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + geminiKey;
-    logToSheet("📷 [processReceiptPhoto] Calling Gemini 2.5 Flash API with retry...");
+    var url = geminiUrl_(geminiKey);
+    logToSheet("📷 [processReceiptPhoto] Calling " + geminiModel_() + " with retry...");
 
     var payload = {
       "contents": [{
@@ -2906,7 +2910,7 @@ function pollCategorizeImports_(cfg, pollStart) {
   }
 
   var allowed = getAllowedCategories(cfg);
-  var url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + geminiKey;
+  var url = geminiUrl_(geminiKey);
   var done = 0;
 
   while (pending.length) {
@@ -3358,6 +3362,13 @@ function pollSplitwise(opts) {
       logToSheet("pollSplitwise: time budget hit — outward passes deferred to next run.");
     }
 
+    // §28 — digests and the Telegram command menu ride on the sync (see maybeSendDigests_). Last, and
+    // only with budget left, so they can never cost the sync itself; failures only log.
+    if (Date.now() - pollStart <= POLL_BUDGET_MS) {
+      try { maybeSendDigests_(cfg); } catch (dge) { logToSheet("maybeSendDigests_ err: " + dge); }
+      try { registerBotCommands_(); } catch (rce) { logToSheet("registerBotCommands_ err: " + rce); }
+    }
+
     var result = { ok: true, created: created + ng.created, updated: updated + ng.updated, archived: archived + ng.archived,
                    skippedGroups: skippedGroups, backfilling: backfilling, allowedGroups: allowed.length, forced: !!force,
                    nonGroup: ng, retried: retried, deleted: sa.del, rePushed: sa.rep, categorized: categorized, budgetHit: budgetHit };
@@ -3475,8 +3486,11 @@ function getAllowedCategories(cfg) {
 
 function handleCommands(commandText, token, chatId, messageId) {
   var args = commandText.split(" ");
-  var cmd = args[0].toLowerCase();
+  var cmd = args[0].toLowerCase().split("@")[0];   // "/month@IronBankBot" when picked from the menu in a group
+  var words = args.slice(1).filter(function (w) { return w; });
   var cfg = getNotionConfig();
+  var needsNotion = { "/setgroup": 1, "/alias": 1, "/unmapped": 1, "/flags": 1, "/month": 1, "/habit": 1, "/digest": 1 };
+  if (needsNotion[cmd] && !cfg) { sendTelegramMessage(token, chatId, "⚠️ Notion isn't configured.", messageId); return; }
 
   if (cmd === "/start" || cmd === "/help") {
     var welcome = "🏦 **IronBank**\n\n" +
@@ -3487,10 +3501,18 @@ function handleCommands(commandText, token, chatId, messageId) {
       "Shared expenses push to Splitwise automatically. You must be the payer: " +
       "if someone else paid, they log it on their IronBank (or straight in Splitwise) " +
       "and it lands in your Notion on the next sync.\n\n" +
-      "📊 **Commands:**\n" +
-      "/report — this month's spend by category\n" +
-      "/report 2026-06 — a specific month (YYYY-MM)\n" +
+      "📊 **Analysis:**\n" +
+      "/month — this month so far vs the same days last month (`/month 2026-08` for any month)\n" +
+      "/habit biryani — how often you buy something (`/habit cigarettes 60 @24` = last 60 days, ₹24 each)\n" +
+      "/report — a month's spend by category\n" +
       "/settle — who owes whom right now\n" +
+      "/digest — weekly summary on Sundays + last month's report on the 1st (on/off)\n\n" +
+      "🧩 **People & groups:**\n" +
+      "/unmapped — set up everyone missing a Splitwise identity or default group, one tap each\n" +
+      "/setgroup pall edg — change someone's default group (`none` = settle directly)\n" +
+      "/alias mangalik mang — teach a nickname\n\n" +
+      "🛠 **Housekeeping:**\n" +
+      "/flags — review expenses the sync flagged for you\n" +
       "/sync — run the Splitwise↔Notion sync now\n" +
       "/status — last sync + what needs your attention\n" +
       "/help — this guide\n\n" +
@@ -3522,6 +3544,33 @@ function handleCommands(commandText, token, chatId, messageId) {
 
   } else if (cmd === "/status") {
     sendTelegramMessage(token, chatId, cmdStatus_(cfg), messageId);
+
+  } else if (cmd === "/month") {
+    sendTelegramAction(token, chatId, "typing");
+    sendTelegramMessage(token, chatId, cmdMonthText_(cfg, words[0]), messageId);
+
+  } else if (cmd === "/habit") {
+    sendTelegramAction(token, chatId, "typing");
+    sendTelegramMessage(token, chatId, cmdHabitText_(cfg, words), messageId);
+
+  } else if (cmd === "/setgroup") {
+    sendTelegramAction(token, chatId, "typing");
+    cmdSetGroup_(cfg, token, chatId, messageId, words);
+
+  } else if (cmd === "/alias") {
+    sendTelegramAction(token, chatId, "typing");
+    sendTelegramMessage(token, chatId, cmdAliasText_(cfg, words), messageId);
+
+  } else if (cmd === "/unmapped") {
+    sendTelegramAction(token, chatId, "typing");
+    cmdUnmapped_(cfg, token, chatId, messageId);
+
+  } else if (cmd === "/flags") {
+    sendTelegramAction(token, chatId, "typing");
+    cmdFlags_(cfg, token, chatId, messageId);
+
+  } else if (cmd === "/digest") {
+    sendTelegramMessage(token, chatId, cmdDigestText_(cfg, words), messageId);
 
   } else {
     sendTelegramMessage(token, chatId, "🤷 Unknown command. Try /help.", messageId);
@@ -3633,6 +3682,675 @@ function cmdStatus_(cfg) {
 }
 
 // ==========================================
+// §28 — OWNER COMMANDS: people & groups, review queue, analysis, digests
+// ==========================================
+// Everything here is reachable only from the registered owner chat — doPost drops every other chat
+// before a command or button is dispatched. Multi-step commands keep their state in CacheService under
+// a short id, so a button's callback_data stays inside Telegram's 64-byte limit (the name picker's
+// pattern). Anything that changes routing asks for a tap to confirm. Nothing here deletes a Splitwise
+// expense itself: removals are queued through Sync Action, the path the sync already runs and tests.
+
+var BIG_TICKET_INR = 5000;   // /month + digests: at or above this is "big-ticket", below it "everyday"
+var MONTH_NAMES_ = ["January", "February", "March", "April", "May", "June", "July", "August",
+                    "September", "October", "November", "December"];
+
+// Telegram's legacy Markdown breaks on a stray _ * ` or [ — names and notes are user text.
+function mdEsc_(s) { return String(s == null ? "" : s).replace(/([_*`\[])/g, "\\$1"); }
+
+// ₹1,49,243 — Indian digit grouping, whole rupees.
+function inr_(n) {
+  var neg = n < 0, s = String(Math.round(Math.abs(n || 0)));
+  var head = s.slice(0, -3), tail = s.slice(-3);
+  if (head) tail = "," + tail;
+  return (neg ? "-" : "") + "₹" + head.replace(/\B(?=(\d{2})+(?!\d))/g, ",") + tail;
+}
+
+// ₹1.5L / ₹13.6k / ₹950 — for tight one-line lists.
+function inrShort_(n) {
+  var a = Math.abs(n || 0), sign = n < 0 ? "-" : "";
+  if (a >= 100000) return sign + "₹" + (a / 100000).toFixed(1).replace(/\.0$/, "") + "L";
+  if (a >= 1000) return sign + "₹" + (a / 1000).toFixed(1).replace(/\.0$/, "") + "k";
+  return sign + "₹" + Math.round(a);
+}
+
+function pctChange_(cur, prev) {
+  if (!(prev > 0)) return cur > 0 ? "new" : "—";
+  var p = Math.round((cur - prev) / prev * 100);
+  return (p > 0 ? "▲" : p < 0 ? "▼" : "±") + Math.abs(p) + "%";
+}
+
+// Calendar dates as yyyy-MM-dd in the owner's timezone; arithmetic in UTC so nothing drifts.
+function istToday_() { return Utilities.formatDate(new Date(), "GMT+5:30", "yyyy-MM-dd"); }
+function addDays_(ymd, n) {
+  var p = ymd.split("-"), d = new Date(Date.UTC(+p[0], +p[1] - 1, +p[2]) + n * 86400000);
+  return d.getUTCFullYear() + "-" + ("0" + (d.getUTCMonth() + 1)).slice(-2) + "-" + ("0" + d.getUTCDate()).slice(-2);
+}
+function daysInMonth_(y, m) { return new Date(Date.UTC(y, m, 0)).getUTCDate(); }   // m is 1-based
+function prevYm_(ym) {
+  var y = +ym.substring(0, 4), m = +ym.substring(5, 7);
+  return m === 1 ? (y - 1) + "-12" : y + "-" + ("0" + (m - 1)).slice(-2);
+}
+
+// ---- button state ----------------------------------------------------------------------------
+function ibCtxPut_(obj) {
+  var id = Utilities.getUuid().replace(/-/g, "").substring(0, 10);
+  CacheService.getScriptCache().put("ib" + id, JSON.stringify(obj), 21600);
+  return id;
+}
+function ibCtxGet_(id) { var raw = CacheService.getScriptCache().get("ib" + id); return raw ? JSON.parse(raw) : null; }
+function ibCtxSet_(id, obj) { CacheService.getScriptCache().put("ib" + id, JSON.stringify(obj), 21600); }
+function ibBtn_(label, action, id, arg) { return { text: label, callback_data: "ib:" + action + ":" + id + ":" + arg }; }
+
+// ---- Notion reads ----------------------------------------------------------------------------
+function cmdQueryAll_(cfg, dbId, body) {
+  var out = [], cursor = null;
+  do {
+    var b = JSON.parse(JSON.stringify(body || {}));
+    b.page_size = 100;
+    if (cursor) b.start_cursor = cursor;
+    var r = pollNotion_(cfg, "POST", "databases/" + dbId + "/query", b);
+    for (var i = 0; i < r.results.length; i++) out.push(r.results[i]);
+    cursor = r.has_more ? r.next_cursor : null;
+  } while (cursor);
+  return out;
+}
+
+function cmdGroups_(cfg) {
+  return cmdQueryAll_(cfg, cfg.db.groups, {}).map(function (r) {
+    var p = r.properties;
+    return { pageId: r.id, name: pollRichText_(p["Name"]),
+             gid: (p["Splitwise Group ID"] && p["Splitwise Group ID"].number) || null,
+             allowed: !!(p["Allowed"] && p["Allowed"].checkbox) };
+  });
+}
+
+// Everyone except the owner — setting the owner's own group or alias means nothing.
+function cmdPeople_(cfg) {
+  var owner = normName_(getOwnerName()), out = [];
+  var rows = cmdQueryAll_(cfg, cfg.db.people, {});
+  for (var i = 0; i < rows.length; i++) {
+    var p = rows[i].properties, name = pollRichText_(p["Name"]);
+    if (!name || normName_(name) === owner) continue;
+    var dg = (p["Default Group"] && p["Default Group"].relation) || [];
+    out.push({ pageId: rows[i].id, name: name, aliases: pollRichText_(p["Aliases"]),
+               swid: (p["Splitwise User ID"] && p["Splitwise User ID"].number) || null,
+               groupPageId: dg.length ? dg[0].id : null, candidates: pollRichText_(p["Candidates"]) });
+  }
+  return out;
+}
+function cmdPersonNames_(p) { return [p.name].concat(p.aliases ? p.aliases.split(",") : []); }
+function cmdGroupNames_(g) { return [g.name]; }
+
+function cmdSwUsers_(cfg) {
+  if (!cfg.db.swusers) return [];
+  return cmdQueryAll_(cfg, cfg.db.swusers, {}).map(function (r) {
+    var p = r.properties;
+    return { pageId: r.id, name: pollRichText_(p["Name"]),
+             swid: (p["Splitwise User ID"] && p["Splitwise User ID"].number) || null,
+             inGroups: pollRichText_(p["In Groups"]).split(",").map(function (s) { return s.replace(/^\s+|\s+$/g, ""); })
+                       .filter(function (s) { return s; }) };
+  });
+}
+
+// Your share of every expense dated in [startYmd, endYmdExcl), optionally only descriptions containing
+// `titleContains` (Notion's contains is case-insensitive).
+function cmdExpenses_(cfg, startYmd, endYmdExcl, titleContains) {
+  var f = [{ property: "Date", date: { on_or_after: startYmd } }, { property: "Date", date: { before: endYmdExcl } }];
+  if (titleContains) f.push({ property: "Description", title: { contains: titleContains } });
+  return cmdQueryAll_(cfg, cfg.db.expenses, { filter: { and: f } }).map(function (r) {
+    var p = r.properties;
+    return { date: ((p["Date"] && p["Date"].date && p["Date"].date.start) || "").substring(0, 10),
+             desc: pollRichText_(p["Description"]),
+             cat: (p["Expense Type"] && p["Expense Type"].select && p["Expense Type"].select.name) || "Other",
+             share: (p["Amount"] && p["Amount"].number) || 0,
+             total: (p["Total Amount"] && p["Total Amount"].number) || 0 };
+  });
+}
+
+// ---- name matching ---------------------------------------------------------------------------
+// Rank items against what was typed: exact name/alias 0, a word starting with it 1, contains 2,
+// one-letter typo of the first word 3. Returns every item sharing the best rank — so 1 result is a
+// clear answer, 2+ means ask, 0 means nothing matched.
+function cmdMatch_(query, items, namesOf) {
+  var q = normName_(query);
+  if (!q) return [];
+  var best = 9, hits = [];
+  for (var i = 0; i < items.length; i++) {
+    var names = namesOf(items[i]), score = 9;
+    for (var n = 0; n < names.length; n++) {
+      var t = normName_(names[n]);
+      if (!t) continue;
+      var s = 9;
+      if (t === q) s = 0;
+      else if ((" " + t).indexOf(" " + q) >= 0) s = 1;
+      else if (t.indexOf(q) >= 0) s = 2;
+      else if (q.length >= 4 && lev_(q, t.split(/\s+/)[0]) <= 1) s = 3;
+      if (s < score) score = s;
+    }
+    if (score < best) { best = score; hits = [items[i]]; }
+    else if (score === best && score < 9) hits.push(items[i]);
+  }
+  return best < 9 ? hits : [];
+}
+
+// "/setgroup mangalik mitra mumbai expenses" has no delimiter between the two names, so try every
+// split and keep the one where both sides resolve best: unique beats ambiguous beats nothing.
+function cmdSplitPair_(words, leftItems, leftNames, rightItems, rightNames) {
+  var best = null;
+  for (var k = 1; k < words.length; k++) {
+    var lh = cmdMatch_(words.slice(0, k).join(" "), leftItems, leftNames);
+    var rh = cmdMatch_(words.slice(k).join(" "), rightItems, rightNames);
+    var score = (lh.length === 1 ? 0 : lh.length ? 1 : 5) + (rh.length === 1 ? 0 : rh.length ? 1 : 5);
+    if (!best || score < best.score) best = { score: score, left: lh, right: rh, rightText: words.slice(k).join(" ") };
+  }
+  return best;
+}
+
+// ---- /setgroup ---------------------------------------------------------------------------------
+function cmdSetGroup_(cfg, token, chatId, messageId, words) {
+  if (!words.length) {
+    sendTelegramMessage(token, chatId, "Usage: `/setgroup <person> <group>` — e.g. `/setgroup pall edg`\n" +
+      "`/setgroup <person> none` makes them settle directly.\n`/setgroup <person>` shows the groups to pick from.\n" +
+      "People with nothing set yet: /unmapped", messageId);
+    return;
+  }
+  var people = cmdPeople_(cfg), all = cmdGroups_(cfg);
+  var allowed = all.filter(function (g) { return g.allowed && g.gid; });
+  var NONE = /^(none|direct|clear)$/i;
+  var persons, choice;   // choice: undefined = not given, null = clear it, object = one group, array = pick one
+  if (words.length >= 2 && NONE.test(words[words.length - 1])) {
+    persons = cmdMatch_(words.slice(0, -1).join(" "), people, cmdPersonNames_);
+    choice = null;
+  } else {
+    var whole = cmdMatch_(words.join(" "), people, cmdPersonNames_);
+    var pair = words.length >= 2 ? cmdSplitPair_(words, people, cmdPersonNames_, allowed, cmdGroupNames_) : null;
+    if (pair && pair.left.length && pair.right.length && (whole.length !== 1 || pair.score === 0)) {
+      persons = pair.left;
+      choice = pair.right.length === 1 ? pair.right[0] : pair.right;
+    } else {
+      // A group that exists but isn't Allowed would never route — say so instead of "no such person".
+      var pairAll = words.length >= 2 ? cmdSplitPair_(words, people, cmdPersonNames_, all, cmdGroupNames_) : null;
+      if (!whole.length && pairAll && pairAll.left.length === 1 && pairAll.right.length === 1 && !pairAll.right[0].allowed) {
+        sendTelegramMessage(token, chatId, "*" + mdEsc_(pairAll.right[0].name) + "* isn't Allowed, so IronBank never " +
+          "sends expenses there. Tick *Allowed* for it in Notion → Groups first (that also imports its history).", messageId);
+        return;
+      }
+      persons = whole;
+      choice = undefined;
+    }
+  }
+  if (!persons.length) {
+    sendTelegramMessage(token, chatId, "I couldn't find anyone called \"" + mdEsc_(words.join(" ")) + "\". /unmapped lists everyone who still needs setting up.", messageId);
+    return;
+  }
+  var names = {};
+  for (var i = 0; i < all.length; i++) names[all[i].pageId] = all[i].name;
+  var ctx = { persons: persons.map(function (p) { return { pageId: p.pageId, name: p.name, swid: p.swid, groupPageId: p.groupPageId }; }),
+              person: persons.length === 1 ? persons[0] : null,
+              groups: allowed.map(function (g) { return { pageId: g.pageId, name: g.name }; }),
+              choice: choice === undefined ? undefined : (choice === null ? null :
+                      (choice.length ? choice.map(function (g) { return { pageId: g.pageId, name: g.name }; }) : { pageId: choice.pageId, name: choice.name })),
+              names: names };
+  if (ctx.person) ctx.person = { pageId: ctx.person.pageId, name: ctx.person.name, swid: ctx.person.swid, groupPageId: ctx.person.groupPageId };
+  var id = ibCtxPut_(ctx), step = cmdSetGroupStep_(id, ctx);
+  sendTelegramMessage(token, chatId, step.text, messageId, "Markdown", step.kb);
+}
+
+function cmdSetGroupStep_(id, ctx) {
+  var kb = [], i;
+  if (!ctx.person) {
+    for (i = 0; i < ctx.persons.length && i < 8; i++) kb.push([ibBtn_("👤 " + ctx.persons[i].name, "sgp", id, i)]);
+    kb.push([ibBtn_("✖ Cancel", "sgc", id, "n")]);
+    return { text: "Which person did you mean?", kb: { inline_keyboard: kb } };
+  }
+  var cur = ctx.person.groupPageId ? (ctx.names[ctx.person.groupPageId] || "a group") : "none (direct)";
+  if (ctx.choice === undefined || (ctx.choice && ctx.choice.length)) {
+    var opts = ctx.choice && ctx.choice.length ? ctx.choice : ctx.groups;
+    var row = [];
+    for (i = 0; i < opts.length && i < 30; i++) {
+      row.push(ibBtn_(opts[i].name, "sgg", id, (ctx.choice && ctx.choice.length) ? "c" + i : i));
+      if (row.length === 2) { kb.push(row); row = []; }
+    }
+    if (row.length) kb.push(row);
+    kb.push([ibBtn_("🤝 Direct (no group)", "sgg", id, "n"), ibBtn_("✖ Cancel", "sgc", id, "n")]);
+    return { text: "*" + mdEsc_(ctx.person.name) + "* — default group now: *" + mdEsc_(cur) + "*.\nPick the new one:",
+             kb: { inline_keyboard: kb } };
+  }
+  var to = ctx.choice ? ctx.choice.name : "none (direct)";
+  var warn = ctx.person.swid ? "" : "\n\n⚠️ " + mdEsc_(ctx.person.name) + " has no Splitwise identity yet, so this only takes effect once that's set (/unmapped).";
+  return { text: "Change *" + mdEsc_(ctx.person.name) + "*'s default group?\n*" + mdEsc_(cur) + "* → *" + mdEsc_(to) + "*" + warn,
+           kb: { inline_keyboard: [[ibBtn_("✅ Confirm", "sgc", id, "y"), ibBtn_("✖ Cancel", "sgc", id, "n")]] } };
+}
+
+function cbSetGroup_(cfg, token, chatId, messageId, callbackId, action, id, arg, ctx) {
+  if (action === "sgp") {
+    var p = ctx.persons[+arg];
+    if (p) ctx.person = p;
+  } else if (action === "sgg") {
+    if (arg === "n") ctx.choice = null;
+    else if (arg.charAt(0) === "c") ctx.choice = ctx.choice[+arg.substring(1)];
+    else ctx.choice = ctx.groups[+arg];
+  } else if (action === "sgc") {
+    if (arg !== "y") { answerCallbackQuery(token, callbackId, "Cancelled"); editTelegramMessage(token, chatId, messageId, "✖ Cancelled — nothing changed."); return; }
+    pollNotion_(cfg, "PATCH", "pages/" + ctx.person.pageId, { properties: {
+      "Default Group": { relation: ctx.choice ? [{ id: ctx.choice.pageId }] : [] } } });
+    answerCallbackQuery(token, callbackId, "✅ Saved");
+    editTelegramMessage(token, chatId, messageId, ctx.choice
+      ? "✅ *" + mdEsc_(ctx.person.name) + "* → *" + mdEsc_(ctx.choice.name) + "*. New expenses with them go into that group; anything parked for them retries on the next sync (/sync runs it now)."
+      : "✅ *" + mdEsc_(ctx.person.name) + "* now settles directly with you (no group).");
+    return;
+  }
+  ibCtxSet_(id, ctx);
+  var step = cmdSetGroupStep_(id, ctx);
+  answerCallbackQuery(token, callbackId, "");
+  editTelegramMessage(token, chatId, messageId, step.text, step.kb);
+}
+
+// ---- /alias ------------------------------------------------------------------------------------
+function cmdAliasText_(cfg, words) {
+  if (!words.length) return "Usage: `/alias <person> <nickname>` — e.g. `/alias mangalik mang`\n`/alias <person>` shows their nicknames.";
+  var people = cmdPeople_(cfg), typed = words.join(" ");
+  var exact = cmdMatch_(typed, people, cmdPersonNames_);
+  // The whole text naming someone exactly means "show", not "add the last word as a nickname":
+  // "/alias mangalik mitra" is a question about Mangalik Mitra, not a request to alias "mitra".
+  var isExact = exact.length === 1 && cmdPersonNames_(exact[0]).some(function (n) { return normName_(n) === normName_(typed); });
+  var person = null, alias = "";
+  if (!isExact) {
+    for (var k = words.length - 1; k >= 1 && !person; k--) {   // longest name first
+      var hit = cmdMatch_(words.slice(0, k).join(" "), people, cmdPersonNames_);
+      if (hit.length === 1) { person = hit[0]; alias = words.slice(k).join(" "); }
+    }
+  }
+  if (!person) {
+    if (exact.length === 1) {
+      var al = exact[0].aliases ? exact[0].aliases.split(",").map(function (s) { return s.replace(/^\s+|\s+$/g, ""); }).filter(function (s) { return s; }) : [];
+      return "*" + mdEsc_(exact[0].name) + "* is known as: " + (al.length ? mdEsc_(al.join(", ")) : "no nicknames yet") +
+             "\nAdd one: `/alias " + mdEsc_(exact[0].name.split(" ")[0].toLowerCase()) + " <nickname>`";
+    }
+    if (exact.length > 1) return "\"" + mdEsc_(typed) + "\" could be " + mdEsc_(exact.map(function (p) { return p.name; }).join(", ")) + " — use more of the name.";
+    return "I couldn't find anyone called \"" + mdEsc_(typed) + "\".";
+  }
+  var aLow = normName_(alias);
+  if (NOTION_OWNER_ALIASES[aLow] === 1 || aLow === normName_(getOwnerName())) return "\"" + mdEsc_(alias) + "\" always means you — it can't be someone's nickname.";
+  var res = saveAlias_(cfg, person.pageId, alias);
+  if (res.ok && res.reason === "already present") return "\"" + mdEsc_(alias) + "\" already means *" + mdEsc_(person.name) + "*.";
+  if (res.ok) return "✅ From now on \"" + mdEsc_(alias) + "\" means *" + mdEsc_(person.name) + "*.";
+  if (/^claimed by /.test(res.reason || "")) return "\"" + mdEsc_(alias) + "\" already belongs to *" + mdEsc_(res.reason.substring(11)) +
+    "* — a nickname can only point to one person, or expenses would park. Remove it there in Notion first.";
+  return "Couldn't save that nickname (" + mdEsc_(res.reason || "unknown") + ").";
+}
+
+// ---- /unmapped ---------------------------------------------------------------------------------
+// Walks through everyone who blocks or limits syncing, one person per step: first people with no
+// Splitwise identity (their expenses can't sync at all), then people with no default group who share
+// an Allowed group with you. One tap sets each; the message edits itself on to the next person.
+function cmdUnmapped_(cfg, token, chatId, messageId) {
+  var people = cmdPeople_(cfg), sw = cmdSwUsers_(cfg), groups = cmdGroups_(cfg);
+  var allowedByName = {}, swByName = {}, swBySwid = {}, taken = {}, i;
+  for (i = 0; i < groups.length; i++) if (groups[i].allowed && groups[i].gid) allowedByName[normName_(groups[i].name)] = groups[i];
+  for (i = 0; i < sw.length; i++) { swByName[normName_(sw[i].name)] = sw[i]; if (sw[i].swid) swBySwid[sw[i].swid] = sw[i]; }
+  for (i = 0; i < people.length; i++) if (people[i].swid) taken[people[i].swid] = people[i].name;
+  function groupOpts(su) {
+    var out = [];
+    for (var g = 0; su && g < su.inGroups.length; g++) {
+      var hit = allowedByName[normName_(su.inGroups[g])];
+      if (hit) out.push({ label: hit.name, kind: "group", groupPage: hit.pageId });
+    }
+    return out;
+  }
+  var ids = [], grp = [];
+  for (i = 0; i < people.length; i++) {
+    var p = people[i];
+    if (!p.swid) {
+      var opts = [], cands = (p.candidates || "").split(",");
+      for (var c = 0; c < cands.length && opts.length < 3; c++) {
+        var s = swByName[normName_(cands[c])];
+        if (s && s.swid) opts.push({ label: s.name, kind: "id", swPage: s.pageId, swid: s.swid, swName: s.name, groupOpts: groupOpts(s) });
+      }
+      ids.push({ kind: "identity", pageId: p.pageId, name: p.name, opts: opts });
+    } else if (!p.groupPageId) {
+      var go = groupOpts(swBySwid[p.swid]);
+      if (go.length) grp.push({ kind: "group", pageId: p.pageId, name: p.name, opts: go });
+    }
+  }
+  var queue = ids.concat(grp);
+  if (!queue.length) { sendTelegramMessage(token, chatId, "✅ Everyone is set up — nobody is missing a Splitwise identity, and everyone who shares an Allowed group with you has a default group.", messageId); return; }
+  var ctx = { queue: queue, i: 0, done: 0, skipped: 0, taken: taken };
+  var id = ibCtxPut_(ctx), step = cmdUnmappedStep_(id, ctx);
+  sendTelegramMessage(token, chatId, step.text, messageId, "Markdown", step.kb);
+}
+
+function cmdUnmappedStep_(id, ctx) {
+  var it = ctx.queue[ctx.i], kb = [];
+  var head = "🧩 *Set up " + (ctx.i + 1) + " of " + ctx.queue.length + "*\n\n";
+  var text = it.kind === "identity"
+    ? head + "*" + mdEsc_(it.name) + "* has no Splitwise identity, so expenses with them can't sync.\n" +
+      (it.opts.length ? "Which of your Splitwise contacts is this?"
+                      : "No likely match among your Splitwise contacts — set it in Notion → People, or use *Merge Into* if this is a duplicate of someone.")
+    : head + "*" + mdEsc_(it.name) + "* has no default group, so expenses with them settle directly between you. They're also in:";
+  for (var n = 0; n < it.opts.length; n++) kb.push([ibBtn_((it.kind === "group" ? "👥 " : "👤 ") + it.opts[n].label, "un", id, ctx.i + "." + n)]);
+  kb.push([ibBtn_(it.kind === "group" ? "🤝 Keep direct" : "⏭ Skip", "un", id, ctx.i + ".s"), ibBtn_("✋ Stop", "un", id, ctx.i + ".x")]);
+  return { text: text, kb: { inline_keyboard: kb } };
+}
+
+function cbUnmapped_(cfg, token, chatId, messageId, callbackId, id, arg, ctx) {
+  var at = arg.split("."), stepIdx = +at[0], pick = at[1];
+  if (stepIdx !== ctx.i) { answerCallbackQuery(token, callbackId, "Already done"); return; }   // double tap
+  var it = ctx.queue[ctx.i], note = "";
+  if (pick === "x") {
+    answerCallbackQuery(token, callbackId, "Stopped");
+    editTelegramMessage(token, chatId, messageId, "✋ Stopped — " + ctx.done + " set up, " + ctx.skipped + " skipped. /unmapped picks up the rest any time.");
+    return;
+  }
+  if (pick === "s") { ctx.skipped++; note = "Skipped"; }
+  else {
+    var o = it.opts[+pick];
+    if (o.kind === "id") {
+      if (ctx.taken[o.swid]) {
+        // Two People rows on one Splitwise account is a duplicate person, not a second identity.
+        answerCallbackQuery(token, callbackId, "Already used by " + ctx.taken[o.swid]);
+        editTelegramMessage(token, chatId, messageId, "⚠️ *" + mdEsc_(o.label) + "* is already linked to *" + mdEsc_(ctx.taken[o.swid]) +
+          "*. *" + mdEsc_(it.name) + "* is probably a duplicate — in Notion → People set its *Merge Into* to " + mdEsc_(ctx.taken[o.swid]) + ".",
+          cmdUnmappedStep_(id, ctx).kb);
+        return;
+      }
+      pollNotion_(cfg, "PATCH", "pages/" + it.pageId, { properties: {
+        "Splitwise Identity": { relation: [{ id: o.swPage }] },
+        "Splitwise User ID": { number: o.swid },
+        "Splitwise Name": { rich_text: [{ text: { content: o.swName } }] } } });
+      ctx.taken[o.swid] = it.name;
+      // Now that they're identified, offer their default group straight away rather than on the next run.
+      if (o.groupOpts && o.groupOpts.length) ctx.queue.splice(ctx.i + 1, 0, { kind: "group", pageId: it.pageId, name: it.name, opts: o.groupOpts });
+      note = "✅ " + it.name + " = " + o.label;
+    } else {
+      pollNotion_(cfg, "PATCH", "pages/" + it.pageId, { properties: { "Default Group": { relation: [{ id: o.groupPage }] } } });
+      note = "✅ " + it.name + " → " + o.label;
+    }
+    ctx.done++;
+  }
+  ctx.i++;
+  answerCallbackQuery(token, callbackId, note);
+  if (ctx.i >= ctx.queue.length) {
+    editTelegramMessage(token, chatId, messageId, "✅ All done — " + ctx.done + " set up, " + ctx.skipped + " skipped." +
+      (ctx.done ? "\nAnything parked for them retries on the next sync (/sync runs it now)." : ""));
+    return;
+  }
+  ibCtxSet_(id, ctx);
+  var step = cmdUnmappedStep_(id, ctx);
+  editTelegramMessage(token, chatId, messageId, step.text, step.kb);
+}
+
+// ---- /flags ------------------------------------------------------------------------------------
+// The review queue — every expense with a Sync Status note — one per step. "Reviewed" clears the note.
+// For a row that is no longer on Splitwise (the sync converted it rather than dropping it) Re-push and
+// Remove are offered too; both are queued as Sync Actions for the next sync, never run from here.
+function cmdFlags_(cfg, token, chatId, messageId) {
+  var rows = cmdQueryAll_(cfg, cfg.db.expenses, { filter: { property: "Sync Status", rich_text: { is_not_empty: true } },
+                                                  sorts: [{ property: "Date", direction: "descending" }] });
+  if (!rows.length) { sendTelegramMessage(token, chatId, "✅ Nothing to review — no flagged expenses.", messageId); return; }
+  var queue = rows.slice(0, 50).map(function (r) {
+    var p = r.properties;
+    return { pageId: r.id, date: ((p["Date"] && p["Date"].date && p["Date"].date.start) || "").substring(0, 10),
+             desc: pollRichText_(p["Description"]), share: (p["Amount"] && p["Amount"].number) || 0,
+             total: (p["Total Amount"] && p["Total Amount"].number) || 0, note: pollRichText_(p["Sync Status"]),
+             onSw: !!pollRichText_(p["Splitwise ID"]) };
+  });
+  var ctx = { queue: queue, i: 0, done: 0, more: rows.length - queue.length };
+  var id = ibCtxPut_(ctx), step = cmdFlagsStep_(id, ctx);
+  sendTelegramMessage(token, chatId, step.text, messageId, "Markdown", step.kb);
+}
+
+function cmdFlagsStep_(id, ctx) {
+  var it = ctx.queue[ctx.i], tag = "";
+  var m = /\[([^\]]+)\]/.exec(it.note);
+  if (m) tag = " — " + m[1];
+  var note = it.note.length > 700 ? it.note.substring(0, 700) + "…" : it.note;
+  var text = "🚩 *Review " + (ctx.i + 1) + " of " + ctx.queue.length + "*" + mdEsc_(tag) + "\n" +
+    "📅 " + it.date + " · *" + mdEsc_(it.desc) + "*\n💰 Your share " + inr_(it.share) + " of " + inr_(it.total) + "\n\n" + mdEsc_(note);
+  var kb = [[ibBtn_("✓ Reviewed", "fl", id, ctx.i + ".r"), ibBtn_("⏭ Skip", "fl", id, ctx.i + ".s")]];
+  if (!it.onSw) kb.push([ibBtn_("🔁 Re-push to Splitwise", "fl", id, ctx.i + ".p"), ibBtn_("🗑 Remove expense", "fl", id, ctx.i + ".d")]);
+  kb.push([ibBtn_("✋ Stop", "fl", id, ctx.i + ".x")]);
+  return { text: text, kb: { inline_keyboard: kb } };
+}
+
+function cbFlags_(cfg, token, chatId, messageId, callbackId, id, arg, ctx) {
+  var at = arg.split("."), stepIdx = +at[0], pick = at[1];
+  if (stepIdx !== ctx.i) { answerCallbackQuery(token, callbackId, "Already done"); return; }
+  var it = ctx.queue[ctx.i], note = "Skipped";
+  if (pick === "x") {
+    answerCallbackQuery(token, callbackId, "Stopped");
+    editTelegramMessage(token, chatId, messageId, "✋ Stopped — " + ctx.done + " handled. /flags shows what's left.");
+    return;
+  }
+  if (pick === "r") {
+    pollNotion_(cfg, "PATCH", "pages/" + it.pageId, { properties: { "Sync Status": { rich_text: [] } } });
+    note = "✓ Cleared"; ctx.done++;
+  } else if ((pick === "p" || pick === "d") && !it.onSw) {
+    pollNotion_(cfg, "PATCH", "pages/" + it.pageId, { properties: {
+      "Sync Action": { select: { name: pick === "p" ? "Re-push" : "Delete" } }, "Sync Status": { rich_text: [] } } });
+    note = pick === "p" ? "🔁 Re-push queued" : "🗑 Removal queued"; ctx.done++;
+  }
+  ctx.i++;
+  answerCallbackQuery(token, callbackId, note);
+  if (ctx.i >= ctx.queue.length) {
+    editTelegramMessage(token, chatId, messageId, "✅ Review done — " + ctx.done + " handled." +
+      (ctx.more ? "\n" + ctx.more + " more beyond the first 50 — run /flags again." : "") +
+      "\nQueued re-pushes and removals run on the next sync (/sync runs it now).");
+    return;
+  }
+  ibCtxSet_(id, ctx);
+  var step = cmdFlagsStep_(id, ctx);
+  editTelegramMessage(token, chatId, messageId, step.text, step.kb);
+}
+
+// ---- /month ------------------------------------------------------------------------------------
+// A month against the one before. For the current month it compares like with like — the 1st to today
+// against the same days last month — so a month in progress isn't measured against a finished one.
+function cmdMonthText_(cfg, ym) {
+  var today = istToday_(), cur = today.substring(0, 7);
+  if (!ym) ym = cur;
+  if (!/^\d{4}-\d{2}$/.test(ym)) return "Usage: /month or /month YYYY-MM";
+  if (ym > cur) return "That month hasn't happened yet.";
+  var y = +ym.substring(0, 4), m = +ym.substring(5, 7), isCur = ym === cur;
+  var span = isCur ? +today.substring(8, 10) : daysInMonth_(y, m);
+  var pYm = prevYm_(ym), pdim = daysInMonth_(+pYm.substring(0, 4), +pYm.substring(5, 7));
+  var pSpan = isCur ? Math.min(span, pdim) : pdim;
+  var tStart = ym + "-01", tEnd = addDays_(tStart, span), pStart = pYm + "-01", pEnd = addDays_(pStart, pSpan);
+  var rows = cmdExpenses_(cfg, pStart, tEnd);
+  function stats(a, b) {
+    var s = { total: 0, n: 0, big: 0, bigItems: [], every: 0, cats: {} };
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      if (r.date < a || r.date >= b || !(r.share > 0)) continue;
+      s.total += r.share; s.n++;
+      s.cats[r.cat] = (s.cats[r.cat] || 0) + r.share;
+      if (r.share >= BIG_TICKET_INR) { s.big += r.share; s.bigItems.push(r); } else s.every += r.share;
+    }
+    s.bigItems.sort(function (x, z) { return z.share - x.share; });
+    return s;
+  }
+  var A = stats(tStart, tEnd), B = stats(pStart, pEnd);
+  var name = MONTH_NAMES_[m - 1], pName = MONTH_NAMES_[+pYm.substring(5, 7) - 1];
+  if (!A.n && !B.n) return "📊 No expenses logged for " + name + " " + y + ".";
+  var head = isCur
+    ? "📊 *" + name + " so far* (1–" + span + " " + name.substring(0, 3) + ") vs 1–" + pSpan + " " + pName.substring(0, 3)
+    : "📊 *" + name + " " + y + "* vs " + pName;
+  var lines = [head, "",
+    "*Total* " + inr_(A.total) + " · " + inr_(A.total / span) + "/day · " + pctChange_(A.total, B.total) + " (" + inr_(B.total) + ")",
+    "*Everyday* (under " + inrShort_(BIG_TICKET_INR) + ") " + inr_(A.every) + " · " + pctChange_(A.every, B.every) + " (" + inr_(B.every) + ")"];
+  if (A.bigItems.length) {
+    lines.push("*Big-ticket* " + inr_(A.big) + " — " + A.bigItems.slice(0, 3).map(function (r) {
+      return mdEsc_(r.desc.length > 22 ? r.desc.substring(0, 22) + "…" : r.desc) + " " + inr_(r.share); }).join(" · ") +
+      (A.bigItems.length > 3 ? " · +" + (A.bigItems.length - 3) + " more" : ""));
+  }
+  var catNames = {}, k;
+  for (k in A.cats) catNames[k] = 1;
+  for (k in B.cats) catNames[k] = 1;
+  var moves = Object.keys(catNames).map(function (c) { return { c: c, d: (A.cats[c] || 0) - (B.cats[c] || 0) }; })
+    .filter(function (x) { return Math.abs(x.d) >= 500; })
+    .sort(function (x, z) { return Math.abs(z.d) - Math.abs(x.d); }).slice(0, 4);
+  if (moves.length) {
+    lines.push("", "*Moved most*");
+    lines.push(moves.map(function (x) { return mdEsc_(x.c) + " " + (x.d > 0 ? "▲ " : "▼ ") + inrShort_(Math.abs(x.d)); }).join(" · "));
+  }
+  var top = Object.keys(A.cats).sort(function (x, z) { return A.cats[z] - A.cats[x]; }).slice(0, 4);
+  if (top.length) {
+    lines.push("", "*Top categories*");
+    lines.push(top.map(function (c) { return mdEsc_(c) + " " + inrShort_(A.cats[c]); }).join(" · "));
+  }
+  lines.push("", A.n + " expenses · your share only — money you lent isn't counted");
+  return lines.join("\n");
+}
+
+// ---- /habit ------------------------------------------------------------------------------------
+// "/habit cigarettes 60 @24" — how often you buy something, from the descriptions. Days default to 30.
+// "@price" turns spend into an estimated count ("≈ 347 at ₹24").
+function cmdHabitText_(cfg, words) {
+  var days = 30, price = 0, terms = [];
+  for (var i = 0; i < words.length; i++) {
+    if (/^\d{1,3}$/.test(words[i])) days = Math.min(365, Math.max(1, +words[i]));
+    else if (/^@\d+(\.\d+)?$/.test(words[i])) price = +words[i].substring(1);
+    else terms.push(words[i]);
+  }
+  var term = terms.join(" ").replace(/^\s+|\s+$/g, "");
+  if (!term) return "Usage: `/habit <word> [days] [@price]` — e.g. `/habit biryani`, `/habit cigarettes 60 @24`";
+  var q = term.toLowerCase();
+  if (q.length > 4 && /s$/.test(q)) q = q.slice(0, -1);   // "cigarettes" also finds "Cigarette"
+  var today = istToday_(), start = addDays_(today, -(days - 1)), pStart = addDays_(start, -days);
+  var rows = cmdExpenses_(cfg, pStart, addDays_(today, 1), q).filter(function (r) { return r.share > 0; });
+  var cur = rows.filter(function (r) { return r.date >= start; }), prev = rows.filter(function (r) { return r.date < start; });
+  if (!cur.length && !prev.length) return "No expenses matching \"" + mdEsc_(q) + "\" in the last " + (days * 2) + " days.";
+  var spend = 0, dayset = {};
+  for (i = 0; i < cur.length; i++) { spend += cur[i].share; dayset[cur[i].date] = 1; }
+  var prevSpend = 0;
+  for (i = 0; i < prev.length; i++) prevSpend += prev[i].share;
+  var lines = ["🔍 *\"" + mdEsc_(q) + "\"* — last " + days + " days", ""];
+  if (!cur.length) {
+    lines.push("Nothing in the last " + days + " days (" + inr_(prevSpend) + " in the " + days + " days before).");
+    return lines.join("\n");
+  }
+  lines.push(cur.length + " purchase" + (cur.length === 1 ? "" : "s") + " on " + Object.keys(dayset).length + " of " + days + " days · " + inr_(spend));
+  lines.push(inr_(spend / days) + "/day · " + inr_(spend / days * 7) + "/week · " + inr_(spend / cur.length) + " per purchase");
+  if (price > 0) {
+    var units = spend / price;
+    lines.push("≈ " + Math.round(units) + " at " + inr_(price) + " each → " + (units / days).toFixed(1) + "/day");
+  }
+  lines.push("vs the " + days + " days before: " + pctChange_(spend, prevSpend) + " (" + inr_(prevSpend) + ")");
+  return lines.join("\n");
+}
+
+// ---- digests -----------------------------------------------------------------------------------
+function cmdWeekText_(cfg, endYmd) {
+  var start = addDays_(endYmd, -6), pStart = addDays_(start, -7), end = addDays_(endYmd, 1);
+  var rows = cmdExpenses_(cfg, pStart, end).filter(function (r) { return r.share > 0; });
+  var cur = rows.filter(function (r) { return r.date >= start; });
+  var total = 0, prevTotal = 0, cats = {}, biggest = null, i;
+  for (i = 0; i < rows.length; i++) if (rows[i].date < start) prevTotal += rows[i].share;
+  for (i = 0; i < cur.length; i++) {
+    total += cur[i].share;
+    cats[cur[i].cat] = (cats[cur[i].cat] || 0) + cur[i].share;
+    if (!biggest || cur[i].share > biggest.share) biggest = cur[i];
+  }
+  var d0 = +start.substring(8, 10), d1 = +endYmd.substring(8, 10);
+  var lines = ["📅 *Your week* (" + d0 + " " + MONTH_NAMES_[+start.substring(5, 7) - 1].substring(0, 3) + " – " +
+               d1 + " " + MONTH_NAMES_[+endYmd.substring(5, 7) - 1].substring(0, 3) + ")", ""];
+  if (!cur.length) lines.push("Nothing logged this week.");
+  else {
+    lines.push("Spent " + inr_(total) + " · " + inr_(total / 7) + "/day · " + pctChange_(total, prevTotal) + " vs last week (" + inr_(prevTotal) + ")");
+    lines.push("Top: " + Object.keys(cats).sort(function (a, b) { return cats[b] - cats[a]; }).slice(0, 3)
+      .map(function (c) { return mdEsc_(c) + " " + inrShort_(cats[c]); }).join(" · "));
+    lines.push("Biggest: " + mdEsc_(biggest.desc) + " " + inr_(biggest.share));
+  }
+  try {
+    var flagged = cmdQueryAll_(cfg, cfg.db.expenses, { filter: { property: "Sync Status", rich_text: { is_not_empty: true } } }).length;
+    var parked = cmdQueryAll_(cfg, cfg.db.expenses, { filter: { property: "Settlement Status", select: { equals: "Needs mapping" } } }).length;
+    if (flagged || parked) {
+      lines.push("");
+      if (flagged) lines.push("🚩 " + flagged + " expense" + (flagged === 1 ? "" : "s") + " to review → /flags");
+      if (parked) lines.push("⏸ " + parked + " waiting on someone's setup → /unmapped");
+    }
+  } catch (fe) { logToSheet("digest counts err: " + fe); }
+  lines.push("", "_/month for the full picture · /digest off to stop these_");
+  return lines.join("\n");
+}
+
+// Runs at the end of each sync. A new time trigger would have to live in the loader, which every user
+// pasted by hand — riding on the 15-minute sync needs no loader change. Each digest is marked sent
+// BEFORE sending, so a failure costs one missed digest rather than a message every 15 minutes.
+function maybeSendDigests_(cfg) {
+  if ((getSetting("DIGESTS") || "on").toString().toLowerCase() === "off") return;
+  var token = getSetting("TELEGRAM_BOT_TOKEN"), chat = (getSetting("TELEGRAM_CHAT_ID") || "").toString().trim();
+  if (!token || !chat) return;
+  var now = new Date(), tz = "GMT+5:30";
+  var dow = +Utilities.formatDate(now, tz, "u"), hour = +Utilities.formatDate(now, tz, "H");
+  var today = Utilities.formatDate(now, tz, "yyyy-MM-dd"), dom = +today.substring(8, 10);
+  // Weekly: Sunday from 20:00; a Monday-morning catch-up covers Sunday evenings the sync missed.
+  var sunday = (dow === 7 && hour >= 20) ? today : ((dow === 1 && hour < 12) ? addDays_(today, -1) : null);
+  if (sunday && getSetting("DIGEST_WEEK_SENT") !== sunday) {
+    saveSetting("DIGEST_WEEK_SENT", sunday);
+    sendTelegramMessage(token, chat, cmdWeekText_(cfg, sunday), null);
+  }
+  // Monthly: last month's report from 09:00 on the 1st, catching up through the 3rd.
+  if (dom <= 3 && (dom > 1 || hour >= 9)) {
+    var last = prevYm_(today.substring(0, 7));
+    if (getSetting("DIGEST_MONTH_SENT") !== last) {
+      saveSetting("DIGEST_MONTH_SENT", last);
+      sendTelegramMessage(token, chat, "🗓 *Month-end report*\n\n" + cmdMonthText_(cfg, last) +
+        "\n\n_/digest off to stop these_", null);
+    }
+  }
+}
+
+function cmdDigestText_(cfg, words) {
+  var a = (words[0] || "").toLowerCase();
+  if (a === "off") { saveSetting("DIGESTS", "off"); return "🔕 Digests off. `/digest on` brings them back."; }
+  if (a === "on") { saveSetting("DIGESTS", "on"); return "🔔 Digests on — a weekly summary on Sunday evenings, and last month's report on the 1st."; }
+  if (a === "now") return cmdWeekText_(cfg, istToday_());
+  var on = (getSetting("DIGESTS") || "on").toString().toLowerCase() !== "off";
+  return "Digests are *" + (on ? "on" : "off") + "*: a weekly summary on Sunday evenings and last month's report on the 1st.\n" +
+         "`/digest off` · `/digest on` · `/digest now` for this week's summary right now.";
+}
+
+// Telegram's "/" menu. Re-sent once per IronBank version so new commands appear by themselves.
+function registerBotCommands_() {
+  if (getSetting("BOT_COMMANDS_VER") === IRONBANK_VERSION) return;
+  var token = getSetting("TELEGRAM_BOT_TOKEN");
+  if (!token) return;
+  var list = [["month", "This month vs last month"], ["habit", "How often you buy something, e.g. /habit biryani"],
+              ["report", "A month's spend by category"], ["settle", "Who owes whom right now"],
+              ["flags", "Review flagged expenses"], ["unmapped", "Set up people and default groups"],
+              ["setgroup", "Change someone's default group"], ["alias", "Teach IronBank a nickname"],
+              ["digest", "Weekly and monthly digests on/off"], ["status", "Sync status"],
+              ["sync", "Run the Splitwise sync now"], ["help", "How to use IronBank"]];
+  var r = UrlFetchApp.fetch("https://api.telegram.org/bot" + token + "/setMyCommands", {
+    method: "post", contentType: "application/json", muteHttpExceptions: true,
+    payload: JSON.stringify({ commands: list.map(function (c) { return { command: c[0], description: c[1] }; }) }) });
+  if (r.getResponseCode() === 200) saveSetting("BOT_COMMANDS_VER", IRONBANK_VERSION);
+}
+
+// ---- button dispatch -----------------------------------------------------------------------------
+function handleIbCallback_(token, chatId, messageId, callbackId, data) {
+  var parts = data.split(":"), action = parts[1], id = parts[2], arg = parts[3] || "";
+  var ctx = ibCtxGet_(id);
+  if (!ctx) {
+    answerCallbackQuery(token, callbackId, "⌛ That expired — run the command again.");
+    editTelegramMessage(token, chatId, messageId, "⌛ Expired — run the command again.");
+    return;
+  }
+  var cfg = getNotionConfig();
+  if (!cfg) { answerCallbackQuery(token, callbackId, "Notion isn't configured."); return; }
+  try {
+    if (action === "sgp" || action === "sgg" || action === "sgc") cbSetGroup_(cfg, token, chatId, messageId, callbackId, action, id, arg, ctx);
+    else if (action === "un") cbUnmapped_(cfg, token, chatId, messageId, callbackId, id, arg, ctx);
+    else if (action === "fl") cbFlags_(cfg, token, chatId, messageId, callbackId, id, arg, ctx);
+    else answerCallbackQuery(token, callbackId, "Unknown button");
+  } catch (e) {
+    logToSheet("handleIbCallback_ " + action + " err: " + e);
+    answerCallbackQuery(token, callbackId, "⚠️ That failed: " + String(e).substring(0, 150));
+  }
+}
+
+// ==========================================
 // TELEGRAM SEND API WRAPPERS
 // ==========================================
 
@@ -3712,7 +4430,9 @@ function answerCallbackQuery(token, callbackQueryId, text) {
   logToSheet("💬 [answerCallbackQuery] Response: " + response.getContentText());
 }
 
-function editTelegramMessage(token, chatId, messageId, text) {
+// `replyMarkup` is optional: pass an inline keyboard to keep buttons on the edited message (the §28
+// step-by-step commands), omit it and Telegram removes them — the behaviour every older caller relies on.
+function editTelegramMessage(token, chatId, messageId, text, replyMarkup) {
   var url = "https://api.telegram.org/bot" + token + "/editMessageText";
   var payload = {
     "chat_id": chatId,
@@ -3720,6 +4440,7 @@ function editTelegramMessage(token, chatId, messageId, text) {
     "text": text,
     "parse_mode": "Markdown"
   };
+  if (replyMarkup) payload["reply_markup"] = replyMarkup;
   var options = {
     "method": "post",
     "contentType": "application/json",
@@ -3774,6 +4495,24 @@ function setupWebhook(customUrl) {
 // ==========================================
 // RETRY & RESILIENCE UTILITIES
 // ==========================================
+
+// §29 — which Gemini model to call. This was hardcoded to gemini-2.5-flash in three places, and Google
+// now limits the 2.5 models to accounts that were already using them: a fresh IronBank install could be
+// refused outright, breaking text logging, receipts and categorisation together. It is now the
+// GEMINI_MODEL Script Property, so any install can switch without a code change. The default stays
+// 2.5 Flash so nothing changes for anyone until they choose. Only the model name is configurable — no
+// generation parameters are sent that haven't been verified against the live API.
+var GEMINI_DEFAULT_MODEL = "gemini-2.5-flash";
+
+function geminiModel_() {
+  var m = (getSetting("GEMINI_MODEL") || "").toString().replace(/^\s+|\s+$/g, "");
+  // A model id is letters, digits, dots and dashes; anything else would be spliced into the URL path.
+  return /^[A-Za-z0-9.\-]+$/.test(m) ? m : GEMINI_DEFAULT_MODEL;
+}
+
+function geminiUrl_(geminiKey) {
+  return "https://generativelanguage.googleapis.com/v1beta/models/" + geminiModel_() + ":generateContent?key=" + geminiKey;
+}
 
 function callGeminiWithRetry(url, options, maxRetries) {
   var retries = maxRetries || 3;

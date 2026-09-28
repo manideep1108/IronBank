@@ -29,7 +29,12 @@ SETTLE     Splitwise — native settlement + authoritative balances
 - **Automatic Splitwise settlement** — each participant is routed to their default Splitwise group, or settled as a direct friend expense if they have none. One expense can span several groups; you always see exactly who owes what in the bot's reply.
 - **Everything lands in Notion** — one row per expense with your share, the full bill, category, payment mode, participants, and settlement status. Your Splitwise activity (including expenses *others* paid) flows in automatically and is auto-categorized by Gemini against your Notion category list.
 - **Live balances** — every sync refreshes each person's net balance from Splitwise. `/settle` in Telegram or the Balances view in Notion answers "who owes whom" at any moment.
-- **Bot commands** — `/report` (monthly spend by category), `/settle` (balances), `/sync` (run the sync now), `/status` (sync health + what needs attention), `/help`.
+- **Analysis in Telegram** — `/month` (this month so far against the same days last month, split into everyday and big-ticket spend), `/habit biryani` (how often you buy something; `/habit cigarettes 60 @24` for 60 days at ₹24 each), `/report` (a month by category), `/settle` (balances).
+- **Automatic digests** — a weekly summary every Sunday evening and last month's report on the 1st, sent by the bot on its own. `/digest off` stops them.
+- **Manage people from the chat** — `/unmapped` walks through everyone missing a Splitwise identity or default group with one-tap buttons; `/setgroup pall edg` changes someone's default group (`none` to settle directly); `/alias mangalik mang` teaches a nickname.
+- **Review queue** — `/flags` steps through every expense the sync flagged for you (a share absorbed, a bill replaced, a deletion on Splitwise) and clears or resolves each with a tap.
+- **Housekeeping** — `/sync` (run the sync now), `/status` (sync health + what needs attention), `/help`.
+- **Choice of Gemini model** — set the `GEMINI_MODEL` Script Property to switch models (default `gemini-2.5-flash`); no code change needed.
 
 ## The two rules
 
