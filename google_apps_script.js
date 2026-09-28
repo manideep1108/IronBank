@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.12.0";
+var IRONBANK_VERSION = "1.13.0";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -740,8 +740,6 @@ function processExpenseText(text, geminiKey, token, chatId, messageId, ownerName
       "9. Write the description as a SHORT label (2-4 words) naming WHAT was bought — 'Alcohol', 'Auto to office', 'Dinner'. Never copy the input sentence into it, and never put the amount, the split instructions, or participant names in it.\n" +
       "Text to parse:\n\"" + text + "\"";
 
-    var url = geminiUrl_(geminiKey);
-
     var payload = {
       "contents": [{
         "parts": [{ "text": prompt }]
@@ -749,23 +747,7 @@ function processExpenseText(text, geminiKey, token, chatId, messageId, ownerName
       "generationConfig": expenseGenerationConfig_(ctx, "A SHORT label (2-4 words) for WHAT was bought, e.g. 'Alcohol', 'Auto to office', 'Dinner'. NEVER echo the input sentence back, and never include the amount, the split instructions, or participant names.")
     };
 
-    var options = {
-      "method": "post",
-      "contentType": "application/json",
-      "payload": JSON.stringify(payload),
-      "muteHttpExceptions": true
-    };
-
-    var response = callGeminiWithRetry(url, options, 3);
-    var responseCode = response.getResponseCode();
-    var responseText = response.getContentText();
-
-    if (responseCode !== 200) {
-      throw new Error("Gemini API error (" + responseCode + "): " + responseText);
-    }
-
-    var resObj = JSON.parse(responseText);
-    var parsedJson = JSON.parse(resObj.candidates[0].content.parts[0].text);
+    var parsedJson = JSON.parse(geminiGenerate_(geminiKey, payload, "[processExpenseText]").text);
 
     finalizeExpense_(parsedJson, ctx, {
       kind: "text", token: token, chatId: chatId, messageId: messageId, ownerName: ownerName,
@@ -847,8 +829,7 @@ function processReceiptPhoto(photoArray, caption, geminiKey, token, chatId, mess
       expensePerItemRule_(ownerName, 8, "on the receipt/invoice, grouped as the caption specifies",
         "item 1 split between A and B, rest split between A, B, and me");
 
-    var url = geminiUrl_(geminiKey);
-    logToSheet("📷 [processReceiptPhoto] Calling " + geminiModel_() + " with retry...");
+    logToSheet("📷 [processReceiptPhoto] Calling Gemini (" + geminiChain_().map(function (c) { return c.label; }).join(" → ") + ")...");
 
     var payload = {
       "contents": [{
@@ -867,31 +848,11 @@ function processReceiptPhoto(photoArray, caption, geminiKey, token, chatId, mess
       "generationConfig": expenseGenerationConfig_(ctx, "Merchant/Store Name")
     };
 
-    var options = {
-      "method": "post",
-      "contentType": "application/json",
-      "payload": JSON.stringify(payload),
-      "muteHttpExceptions": true
-    };
-
-    var response = callGeminiWithRetry(url, options, 3);
-    var responseCode = response.getResponseCode();
-    var responseText = response.getContentText();
-    logToSheet("📷 [processReceiptPhoto] Gemini response code: " + responseCode);
-
-    if (responseCode !== 200) {
-      logToSheet("📷 [processReceiptPhoto] Error: Gemini returned " + responseCode + ". Body: " + responseText);
-      throw new Error("Gemini API error (" + responseCode + "): " + responseText);
-    }
-
-    var resObj = JSON.parse(responseText);
-    
-    if (!resObj.candidates || resObj.candidates.length === 0 || !resObj.candidates[0].content || !resObj.candidates[0].content.parts || resObj.candidates[0].content.parts.length === 0) {
-      logToSheet("📷 [processReceiptPhoto] Error: Empty candidate response. Body: " + responseText);
-      throw new Error("Gemini returned an empty response. The model might have flagged the image due to safety filters or payload limits.");
-    }
-    
-    var parsedJson = JSON.parse(resObj.candidates[0].content.parts[0].text);
+    // An empty answer (safety filter, oversized image) makes geminiGenerate_ try the next model and,
+    // if every model returns nothing, throw — the same outcome as the old explicit empty-response check.
+    var gen = geminiGenerate_(geminiKey, payload, "📷 [processReceiptPhoto]");
+    logToSheet("📷 [processReceiptPhoto] Answered by " + gen.model);
+    var parsedJson = JSON.parse(gen.text);
     logToSheet("📷 [processReceiptPhoto] Extracted Data: " + JSON.stringify(parsedJson));
 
     // Check if invalid receipt
@@ -2910,7 +2871,6 @@ function pollCategorizeImports_(cfg, pollStart) {
   }
 
   var allowed = getAllowedCategories(cfg);
-  var url = geminiUrl_(geminiKey);
   var done = 0;
 
   while (pending.length) {
@@ -2945,8 +2905,7 @@ function pollCategorizeImports_(cfg, pollStart) {
     };
     var byIdx = {};
     try {
-      var resp = callGeminiWithRetry(url, { "method": "post", "contentType": "application/json", "payload": JSON.stringify(payload), "muteHttpExceptions": true }, 2);
-      var cats = JSON.parse(JSON.parse(resp.getContentText()).candidates[0].content.parts[0].text);
+      var cats = JSON.parse(geminiGenerate_(geminiKey, payload, "[pollCategorizeImports_]").text);
       for (var c = 0; c < cats.length; c++) byIdx[cats[c].index] = cats[c].category;
     } catch (gerr) {
       logToSheet("pollCategorizeImports_: Gemini failed — " + gerr + " (remaining imports retry next run)");
@@ -3678,7 +3637,7 @@ function cmdStatus_(cfg) {
   return "🩺 **Status**\n" +
          "Last sync: " + last + " (/sync runs it now)\n" +
          "Parked expenses (Needs mapping): " + parked + (parked !== "0" ? " — set the person up in Notion → People" : "") + "\n" +
-         "Pending sync actions: " + actions + backfills;
+         "Pending sync actions: " + actions + backfills + "\n" + geminiStatusLine_();
 }
 
 // ==========================================
@@ -4496,60 +4455,121 @@ function setupWebhook(customUrl) {
 // RETRY & RESILIENCE UTILITIES
 // ==========================================
 
-// §29 — which Gemini model to call. This was hardcoded to gemini-2.5-flash in three places, and Google
-// now limits the 2.5 models to accounts that were already using them: a fresh IronBank install could be
-// refused outright, breaking text logging, receipts and categorisation together. It is now the
-// GEMINI_MODEL Script Property, so any install can switch without a code change. The default stays
-// 2.5 Flash so nothing changes for anyone until they choose. Only the model name is configurable — no
-// generation parameters are sent that haven't been verified against the live API.
-var GEMINI_DEFAULT_MODEL = "gemini-2.5-flash";
+// §29 — which Gemini models to call, and in what order. The model used to be hardcoded to
+// gemini-2.5-flash, which on the free tier allows 5 requests a minute and 20 a day — and the owner hit
+// both on a busy day (6/5 and 23/20), at which point every message fails behind a Retry button. Quotas
+// are PER MODEL, so a chain multiplies them: each model below is a separate 20/day. geminiGenerate_
+// walks the chain, moving to the next model on a quota hit, a Google outage, or a refused request.
+//
+// GEMINI_MODELS Script Property: comma-separated model ids, first choice first. "@low" asks that model
+// for thinkingLevel "low" — Google's guidance for simple tasks on 3.8 Flash, whose default is tuned for
+// long agentic work. GEMINI_MODEL (a single id, 1.12.0) is still honoured, as a one-model chain.
+// The default ends with 2.5 Flash, the one model known to work with IronBank's exact request format:
+// if a newer model ever refuses a request, the expense is still logged rather than lost.
+var GEMINI_DEFAULT_CHAIN = "gemini-3.7-flash, gemini-3.8-flash@low, gemini-3.6-flash, gemini-2.5-flash";
 
-function geminiModel_() {
-  var m = (getSetting("GEMINI_MODEL") || "").toString().replace(/^\s+|\s+$/g, "");
-  // A model id is letters, digits, dots and dashes; anything else would be spliced into the URL path.
-  return /^[A-Za-z0-9.\-]+$/.test(m) ? m : GEMINI_DEFAULT_MODEL;
-}
-
-function geminiUrl_(geminiKey) {
-  return "https://generativelanguage.googleapis.com/v1beta/models/" + geminiModel_() + ":generateContent?key=" + geminiKey;
-}
-
-function callGeminiWithRetry(url, options, maxRetries) {
-  var retries = maxRetries || 3;
-  var delayMs = 1500; // 1.5s initial delay
-  var response;
-  var responseCode;
-  var lastError;
-
-  for (var attempt = 1; attempt <= retries; attempt++) {
-    try {
-      logToSheet("🤖 [callGeminiWithRetry] Attempt " + attempt + " of " + retries + "...");
-      response = UrlFetchApp.fetch(url, options);
-      responseCode = response.getResponseCode();
-      var responseText = response.getContentText();
-
-      if (responseCode === 200) {
-        return response;
-      }
-
-      if (responseCode === 429 || responseCode === 503) {
-        lastError = new Error("Gemini API error (" + responseCode + "): " + responseText);
-        logToSheet("⚠️ [callGeminiWithRetry] Attempt " + attempt + " failed (HTTP " + responseCode + "). Retrying in " + delayMs + "ms...");
-        Utilities.sleep(delayMs);
-        delayMs *= 2; // exponential backoff
-      } else {
-        throw new Error("Gemini API error (" + responseCode + "): " + responseText);
-      }
-    } catch (e) {
-      lastError = e;
-      logToSheet("🚨 [callGeminiWithRetry] Exception on attempt " + attempt + ": " + e.toString());
-      if (attempt < retries) {
-        Utilities.sleep(delayMs);
-        delayMs *= 2;
-      }
-    }
+function geminiParseChain_(raw) {
+  var out = [], seen = {}, items = String(raw || "").split(",");
+  for (var i = 0; i < items.length; i++) {
+    var t = items[i].replace(/^\s+|\s+$/g, ""), low = /@low$/i.test(t);
+    if (low) t = t.replace(/@low$/i, "");
+    if (!/^[A-Za-z0-9.\-]+$/.test(t)) continue;   // spliced into the URL path — letters, digits, . and - only
+    var label = t + (low ? "@low" : "");
+    if (seen[label]) continue;
+    seen[label] = 1;
+    out.push({ model: t, low: low, label: label });
   }
-  throw lastError || new Error("Failed to contact Gemini API after " + retries + " attempts");
+  return out;
+}
+
+function geminiChain_() {
+  var chain = geminiParseChain_(getSetting("GEMINI_MODELS") || getSetting("GEMINI_MODEL"));
+  return chain.length ? chain : geminiParseChain_(GEMINI_DEFAULT_CHAIN);
+}
+
+// Daily quotas reset at midnight Pacific time, so "used up today" is tracked against the Pacific date.
+function geminiQuotaDay_() { return Utilities.formatDate(new Date(), "America/Los_Angeles", "yyyy-MM-dd"); }
+
+// {label: pacificDate} for models whose daily quota ran out today; older entries are dropped.
+function geminiSpent_() {
+  var o = {};
+  try { o = JSON.parse(getSetting("GEMINI_EXHAUSTED") || "{}") || {}; } catch (e) { o = {}; }
+  var day = geminiQuotaDay_(), live = {};
+  for (var k in o) if (o[k] === day) live[k] = day;
+  return live;
+}
+
+function geminiMarkSpent_(label) {
+  var live = geminiSpent_();
+  live[label] = geminiQuotaDay_();
+  saveSetting("GEMINI_EXHAUSTED", JSON.stringify(live));
+}
+
+// The model's answer text. Thinking models can return several parts, and thought parts must be skipped —
+// reading only parts[0] (what this file used to do) would parse a thought, or miss half the answer.
+function geminiText_(obj) {
+  var cand = ((obj && obj.candidates) || [])[0] || {};
+  var parts = (cand.content && cand.content.parts) || [];
+  var out = "";
+  for (var i = 0; i < parts.length; i++) if (!parts[i].thought && parts[i].text) out += parts[i].text;
+  return out;
+}
+
+// Call the chain with one request. Returns { text, model }; throws the last error if every model fails.
+//   429, per-minute  -> next model at once (a burst never shows a Retry button)
+//   429, per-day     -> next model, and this one is skipped for the rest of its quota day
+//   5xx / network    -> one retry after 1.5s, then the next model
+//   400 / 403 / 404  -> next model (not available to this key, or this request unsupported by it)
+//   200, no answer   -> next model (blocked by a safety filter, or truncated)
+// Models already marked spent go LAST rather than being dropped: if the reset-time assumption is ever
+// wrong, a spent model is still tried before a message is given up on.
+function geminiGenerate_(geminiKey, payload, tag) {
+  var chain = geminiChain_(), spent = geminiSpent_();
+  var order = chain.filter(function (c) { return !spent[c.label]; })
+                   .concat(chain.filter(function (c) { return spent[c.label]; }));
+  var lastErr = null;
+  for (var i = 0; i < order.length; i++) {
+    var c = order[i];
+    var body = JSON.parse(JSON.stringify(payload));
+    if (c.low) {
+      body.generationConfig = body.generationConfig || {};
+      body.generationConfig.thinkingConfig = { thinkingLevel: "low" };
+    }
+    var url = "https://generativelanguage.googleapis.com/v1beta/models/" + c.model + ":generateContent?key=" + geminiKey;
+    var opts = { method: "post", contentType: "application/json", payload: JSON.stringify(body), muteHttpExceptions: true };
+    for (var attempt = 1; attempt <= 2; attempt++) {
+      var code = 0, txt = "";
+      try {
+        var r = UrlFetchApp.fetch(url, opts);
+        code = r.getResponseCode();
+        txt = r.getContentText();
+      } catch (fe) { txt = String(fe); }
+      if (code === 200) {
+        var answer = "";
+        try { answer = geminiText_(JSON.parse(txt)); } catch (pe) {}
+        if (answer) {
+          if (i > 0) logToSheet("🤖 " + tag + " answered by fallback " + c.label);
+          return { text: answer, model: c.label };
+        }
+        lastErr = new Error("Gemini returned no answer (" + c.label + ") — possibly a safety filter or an oversized input.");
+        break;
+      }
+      lastErr = new Error("Gemini API error (" + code + ") from " + c.label + ": " + String(txt).substring(0, 400));
+      if (code === 429) { if (/PerDay/i.test(txt)) geminiMarkSpent_(c.label); break; }
+      if (code === 0 || code >= 500) { if (attempt < 2) { Utilities.sleep(1500); continue; } }
+      break;
+    }
+    logToSheet("🤖 " + tag + " " + c.label + " failed — " + lastErr.message.substring(0, 160));
+  }
+  throw lastErr || new Error("Gemini API error (no models configured)");
+}
+
+// One line for /status: the chain, and which models have used up today's quota.
+function geminiStatusLine_() {
+  var chain = geminiChain_(), spent = geminiSpent_();
+  return "Gemini: " + chain.map(function (c) {
+    return c.label.replace(/^gemini-/, "") + (spent[c.label] ? " (used up today)" : "");
+  }).join(" → ");
 }
 
 function handleGeminiFailure(token, chatId, messageId, error, retryData) {

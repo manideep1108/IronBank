@@ -34,7 +34,7 @@ SETTLE     Splitwise — native settlement + authoritative balances
 - **Manage people from the chat** — `/unmapped` walks through everyone missing a Splitwise identity or default group with one-tap buttons; `/setgroup pall edg` changes someone's default group (`none` to settle directly); `/alias mangalik mang` teaches a nickname.
 - **Review queue** — `/flags` steps through every expense the sync flagged for you (a share absorbed, a bill replaced, a deletion on Splitwise) and clears or resolves each with a tap.
 - **Housekeeping** — `/sync` (run the sync now), `/status` (sync health + what needs attention), `/help`.
-- **Choice of Gemini model** — set the `GEMINI_MODEL` Script Property to switch models (default `gemini-2.5-flash`); no code change needed.
+- **Gemini fallback chain** — requests go to `gemini-3.7-flash`, then `gemini-3.8-flash` (low thinking), `gemini-3.6-flash` and `gemini-2.5-flash`, moving on whenever one hits its rate limit or refuses a request. Each model has its own free-tier quota (20 requests a day), so the chain covers about 80 messages a day; a model whose daily quota runs out is skipped until it resets. Change the order with the `GEMINI_MODELS` Script Property (comma-separated; add `@low` for low thinking). `/status` shows the chain.
 
 ## The two rules
 
