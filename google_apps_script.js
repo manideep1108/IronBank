@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.10.0";
+var IRONBANK_VERSION = "1.10.1";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -272,16 +272,17 @@ function doPost(e) {
               editTelegramMessage(token, chatId, messageId, "➕ *'" + pCtx.typed + "'* saved as a new person. Pick their *Splitwise Identity* in Notion → People to settle (a Default Group is optional).");
             } else {
               var chosen = pCtx.candidates[Number(pSel)];
+              var pickNote = "It'll settle on the next sync.";
               if (cfgPick && chosen) {
                 try {
                   var strayId = findPersonPageByName_(cfgPick, pCtx.typed);
                   if (strayId && strayId !== chosen.pageId) mergeStrayPerson_(cfgPick, strayId, chosen.pageId, chosen.canonical, pCtx.typed);
                   else saveAlias_(cfgPick, chosen.pageId, pCtx.typed);
-                  if (pCtx.expensePageId) pollNotion_(cfgPick, "PATCH", "pages/" + pCtx.expensePageId, { properties: { "Settlement Status": { select: { name: "Needs mapping" } } } });
+                  if (pCtx.expensePageId) pickNote = pickApplyToExpense_(cfgPick, pCtx.expensePageId, chosen, pCtx.typed);
                 } catch (e) { logToSheet("pick resolve err: " + e); }
               }
               answerCallbackQuery(token, callbackId, "✅ '" + pCtx.typed + "' → " + (chosen ? chosen.canonical : "?"));
-              editTelegramMessage(token, chatId, messageId, "✅ *'" + pCtx.typed + "'* → *" + (chosen ? chosen.canonical : "?") + "* saved. It'll settle on the next sync.");
+              editTelegramMessage(token, chatId, messageId, "✅ *'" + pCtx.typed + "'* → *" + (chosen ? chosen.canonical : "?") + "* saved. " + pickNote);
             }
             return HtmlService.createHtmlOutput("OK");
           } else if (data && data.indexOf("retry_") === 0) {
@@ -1253,6 +1254,53 @@ function sendDisambiguationButtons_(token, chatId, cfg, expensePageId, ambiguous
     rows.push([{ text: "➕ New person", callback_data: "pick_" + cacheId + "_n" }]);
     sendTelegramMessage(token, chatId, "❓ *'" + amb.typed + "'* matches more than one person — who did you mean?", null, "Markdown", { inline_keyboard: rows });
   }
+}
+
+// §25 — after a name is picked from those buttons, decide what the EXPENSE needs. This used to mark
+// it "Needs mapping" unconditionally, which stranded any expense that had ALREADY been pushed:
+// pollRetryNeedsMapping_ rightly refuses to push a row that carries Splitwise IDs (it would charge
+// everyone twice), so the row sat parked forever behind an "already on Splitwise" note recommending
+// a Re-push that would have deleted and re-created a perfectly good expense. Now:
+//   not on Splitwise yet             -> queue it, as before
+//   on Splitwise with the chosen one -> nothing to do (the common case)
+//   on Splitwise without them, or unknown -> leave the status alone and flag it for the user
+// Returns the sentence for the Telegram confirmation.
+function pickApplyToExpense_(cfg, expensePageId, chosen, typed) {
+  var ep = pollNotion_(cfg, "GET", "pages/" + expensePageId, null);
+  var ids = [], raw = pollRichText_(ep.properties["Splitwise ID"]).split(",");
+  for (var i = 0; i < raw.length; i++) { var t = raw[i].replace(/^\s+|\s+$/g, ""); if (t) ids.push(t); }
+  if (!ids.length) {
+    pollNotion_(cfg, "PATCH", "pages/" + expensePageId, { properties: { "Settlement Status": { select: { name: "Needs mapping" } } } });
+    return "It'll push to Splitwise on the next sync.";
+  }
+  // Already pushed. Is the chosen person actually on it? true / false / null (couldn't tell)
+  var onIt = null;
+  try {
+    var person = pollNotion_(cfg, "GET", "pages/" + chosen.pageId, null);
+    var pswid = person.properties["Splitwise User ID"] && person.properties["Splitwise User ID"].number;
+    var swToken = getSetting("SPLITWISE_TOKEN");
+    if (pswid && swToken) {
+      onIt = false;
+      for (var j = 0; j < ids.length && !onIt; j++) {
+        var us = (swGet_(swToken, "get_expense/" + ids[j]).expense || {}).users || [];
+        for (var k = 0; k < us.length; k++) {
+          var uid = us[k].user_id || (us[k].user && us[k].user.id);
+          if (uid === pswid && parseFloat(us[k].owed_share || 0) > 0) { onIt = true; break; }
+        }
+      }
+    }
+  } catch (ce) { logToSheet("pickApplyToExpense_ check failed: " + ce); onIt = null; }
+  if (onIt === true) return "This expense was already on Splitwise with " + chosen.canonical + " — nothing else to do.";
+  // Can't confirm the right person got it: flag rather than guess. Seed from the row's existing note
+  // so addReview_ appends instead of overwriting something the user hasn't read yet.
+  var props = { "Sync Status": ep.properties["Sync Status"] || { rich_text: [] } };
+  addReview_(props, REVIEW_PICKED, "you chose " + chosen.canonical + " for '" + typed + "' after this expense was " +
+    "already on Splitwise, and " + (onIt === false ? chosen.canonical + " is not on it — the split went to someone else."
+                                                   : "it couldn't be confirmed who the split went to.") +
+    " Check the expense in Splitwise; if the wrong person is on it, correct it there and the next sync brings the fix back.");
+  pollNotion_(cfg, "PATCH", "pages/" + expensePageId, { properties: { "Sync Status": props["Sync Status"] } });
+  return "⚠️ This expense was already on Splitwise" + (onIt === false ? " with someone else" : "") +
+         " — flagged in Notion so you can check it.";
 }
 
 // Bot Delete button target: delete an expense by its Notion page id (+ its Splitwise expense(s)).
@@ -2383,6 +2431,7 @@ var REVIEW_ABSORBED = "Share absorbed";
 var REVIEW_BILL_REPLACED = "Bill replaced";
 var REVIEW_OVER_BILL = "Shares exceed bill";
 var REVIEW_RENAMED = "Renamed on Splitwise";
+var REVIEW_PICKED = "Name picked after push";
 
 // Append rather than assign: one sync can legitimately raise two flags on the same row (a share
 // absorbed AND the bill replaced), and silently dropping one of them is the habit this whole section
