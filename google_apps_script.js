@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.10.1";
+var IRONBANK_VERSION = "1.11.0";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -600,6 +600,9 @@ function finalizeExpense_(parsedJson, ctx, opts) {
     return;
   }
 
+  // §26 — one person, one entry, before the arithmetic (see canonicalizeSplitNames_).
+  canonicalizeSplitNames_(parsedJson, cfg, ownerName, ctx.peopleRows);
+
   // Calculate exact splits programmatically using JS
   parsedJson.splits = calculateSplits(parsedJson);
   logToSheet("⚖️ " + tag + " Programmatically calculated splits: " + JSON.stringify(parsedJson.splits));
@@ -627,7 +630,17 @@ function finalizeExpense_(parsedJson, ctx, opts) {
   // If any participant isn't set up yet, the whole expense parks as Needs mapping.
   var syncNote = "";
   var swToken = getSetting("SPLITWISE_TOKEN");
-  if (swToken && cfg && parsedJson.splits && parsedJson.splits.length > 1) {
+  // Push when ANYONE besides the owner owes something. This used to be `splits.length > 1`, which
+  // meant the same thing only while the owner also had a share: paying entirely for one person
+  // ("150 for Kaushal") is a single split, so it was never pushed here — writeToNotion parked it as
+  // "Needs mapping", it showed up in the to-do list, and it reached Splitwise only on the next sync.
+  var ownerLowPush = ownerName.toString().toLowerCase().replace(/^\s+|\s+$/g, "");
+  var hasOthers = false;
+  for (var hs = 0; hs < (parsedJson.splits || []).length && !hasOthers; hs++) {
+    var hn = (parsedJson.splits[hs].name || "").toString().toLowerCase().replace(/^\s+|\s+$/g, "");
+    if (!(NOTION_OWNER_ALIASES[hn] === 1 || hn === ownerLowPush)) hasOthers = true;
+  }
+  if (swToken && cfg && hasOthers) {
     var planRes = executePushPlan_(cfg, swToken, parsedJson, ownerName, ctx.peopleRows);
     if (planRes.success) {
       parsedJson.splitwise_id = planRes.ids.join(",");
@@ -1176,6 +1189,61 @@ function applyResolution_(parsed, res) {
   var splits = parsed.splits || [];
   for (var i = 0; i < splits.length; i++) { var c = res.map[splits[i].name]; if (c) splits[i].name = c; }
   if (parsed.payer && res.map[parsed.payer]) parsed.payer = res.map[parsed.payer];
+  // §26 — resolution can land two different typed names on one person (a nickname Gemini fuzzy-
+  // resolved, next to the full name). Merge them, so no later stage sees that person twice: not the
+  // Notion row, not the Splitwise payload. Amounts are summed — each entry was a real amount owed.
+  var out = [], at = {};
+  for (var j = 0; j < splits.length; j++) {
+    var k = normName_(splits[j].name);
+    if (at[k] !== undefined) {
+      out[at[k]].amount = Math.round(((parseFloat(out[at[k]].amount) || 0) + (parseFloat(splits[j].amount) || 0)) * 100) / 100;
+      continue;
+    }
+    at[k] = out.length; out.push(splits[j]);
+  }
+  parsed.splits = out;
+}
+
+// §26 — one person, one entry, BEFORE the arithmetic. Gemini can name the same person twice — "Mang"
+// in fixed_splits and "Mangalik Mitra" in weighted_splits, or "me" alongside the owner's own name —
+// and every later stage treated each entry as a separate person: the Splitwise payload listed the same
+// user twice, and an equal split gave a double-listed person two shares. Only EXACT matches are merged
+// here (owner aliases, or a Name/alias in People belonging to exactly one person), so nothing is
+// guessed; fuzzy nicknames are resolved later by resolveNames_ and merged again in applyResolution_.
+//   fixed_splits    — same person twice is two amounts they owe      -> sum them
+//   weighted_splits — same person twice is a listing mistake          -> count once (larger weight)
+function canonicalizeSplitNames_(parsed, cfg, ownerName, peopleRows) {
+  var idx = { byKey: {} };
+  if (cfg) { try { idx = buildPeopleIndex_(cfg, peopleRows); } catch (ie) { logToSheet("§26 index err: " + ie); } }
+  var ownerLow = normName_(ownerName);
+  function canon(n) {
+    var low = normName_(n);
+    if (NOTION_OWNER_ALIASES[low] === 1 || low === ownerLow) return ownerName;
+    var hits = idx.byKey[low] || [];
+    return hits.length === 1 ? hits[0].canonical : n;
+  }
+  var fx = parsed.fixed_splits || [], fOut = [], fAt = {};
+  for (var i = 0; i < fx.length; i++) {
+    var cf = canon(fx[i].name), kf = normName_(cf);
+    if (fAt[kf] !== undefined) {
+      fOut[fAt[kf]].amount = (parseFloat(fOut[fAt[kf]].amount) || 0) + (parseFloat(fx[i].amount) || 0);
+      continue;
+    }
+    fAt[kf] = fOut.length; fOut.push({ name: cf, amount: fx[i].amount });
+  }
+  var wx = parsed.weighted_splits || [], wOut = [], wAt = {};
+  for (var j = 0; j < wx.length; j++) {
+    var cw = canon(wx[j].name), kw = normName_(cw);
+    if (wAt[kw] !== undefined) {
+      var cur = wOut[wAt[kw]];
+      if ((parseFloat(wx[j].weight) || 0) > (parseFloat(cur.weight) || 0)) cur.weight = wx[j].weight;
+      logToSheet("§26: '" + wx[j].name + "' is listed twice in the equal split — counted once");
+      continue;
+    }
+    wAt[kw] = wOut.length; wOut.push({ name: cw, weight: wx[j].weight });
+  }
+  parsed.fixed_splits = fOut;
+  parsed.weighted_splits = wOut;
 }
 
 // Append `alias` to a person's Aliases — invariant: an alias belongs to exactly one person.
@@ -1470,6 +1538,20 @@ function pollTodayIso_() {
   return Utilities.formatDate(new Date(), "GMT", "yyyy-MM-dd");
 }
 
+// A Splitwise expense's calendar date, in the owner's timezone. Splitwise returns a UTC instant, and
+// an expense dated 26 Jul in India is stored as 2026-07-25T18:30:00Z — so slicing the first ten
+// characters gave the day BEFORE. That put every such import a day early, moved a pushed expense
+// back a day whenever it was edited on Splitwise, and filed anything dated the 1st under the
+// previous month in /report. Measured: 43 pushed rows sat exactly one day apart from Splitwise.
+// IST matches every other date in this file (Gemini's "today", /report's month).
+function swLocalDate_(iso) {
+  var s = (iso || "").toString();
+  if (!s) return "";
+  var t = new Date(s);
+  if (isNaN(t.getTime())) return s.substring(0, 10);   // unparseable: keep the old behaviour
+  return Utilities.formatDate(t, "GMT+5:30", "yyyy-MM-dd");
+}
+
 function pollNowIso_() {
   return Utilities.formatDate(new Date(), "GMT", "yyyy-MM-dd'T'HH:mm:ss'Z'");
 }
@@ -1550,7 +1632,13 @@ function resolvePushPlanForParticipants_(cfg, parsed, ownerName, peopleRows) {
     if (!r || !r.swid) return { park: "'" + splits[s].name + "' not resolved (no Splitwise ID)" };
     var bucket = r.gid || 0;
     if (!byGroup[bucket]) byGroup[bucket] = [];
-    byGroup[bucket].push({ name: r.name, amount: parseFloat(splits[s].amount || 0), swid: r.swid });
+    // §26 — one Splitwise user, one payload entry. Two names can still reach the same account (a
+    // Primary Identity redirect, or duplicates the name merge couldn't see); sending the same user_id
+    // twice makes Splitwise reject the expense, which parks it for a reason nobody can act on.
+    var same = null;
+    for (var q = 0; q < byGroup[bucket].length; q++) if (byGroup[bucket][q].swid === r.swid) { same = byGroup[bucket][q]; break; }
+    if (same) same.amount = Math.round((same.amount + parseFloat(splits[s].amount || 0)) * 100) / 100;
+    else byGroup[bucket].push({ name: r.name, amount: parseFloat(splits[s].amount || 0), swid: r.swid });
   }
   var groups = [];
   for (var k in byGroup) groups.push({ gid: parseInt(k, 10), participants: byGroup[k] });
@@ -2432,6 +2520,7 @@ var REVIEW_BILL_REPLACED = "Bill replaced";
 var REVIEW_OVER_BILL = "Shares exceed bill";
 var REVIEW_RENAMED = "Renamed on Splitwise";
 var REVIEW_PICKED = "Name picked after push";
+var REVIEW_REMOVED = "Removed on Splitwise";
 
 // Append rather than assign: one sync can legitimately raise two flags on the same row (a share
 // absorbed AND the bill replaced), and silently dropping one of them is the habit this whole section
@@ -2460,7 +2549,7 @@ function pollFlagShareAbsorbed_(props, oldAmount, droppedNames) {
 // record only ever held WHAT OTHERS OWED, so deleting it does not undo the owner's own spending —
 // archiving would erase a real ₹299 from /report on someone else's action. Keep the bill, hand the
 // whole thing to the owner (nobody is covering it now), drop the dead ids, and flag for review.
-function pollConvertToNotionOnly_(cfg, page, why) {
+function pollConvertToNotionOnly_(cfg, page, why, reason) {
   var bill = (page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0;
   var prev = (page.properties["Amount"] && page.properties["Amount"].number) || 0;
   var bill2 = Math.round(bill * 100) / 100;
@@ -2477,7 +2566,7 @@ function pollConvertToNotionOnly_(cfg, page, why) {
     // non-owner participants" instead of recreating anything. Keeping them is what makes the Re-push
     // offered below actually work, and what lets the row still say who this was shared with.
   };
-  addReview_(props, REVIEW_DELETED, why + " Nobody is covering it now, so your share reads the whole ₹" +
+  addReview_(props, reason || REVIEW_DELETED, why + " Nobody is covering it now, so your share reads the whole ₹" +
     bill2.toFixed(2) + " bill (was ₹" + prev.toFixed(2) + "). The split below is what had been agreed. " +
     "Re-push recreates it on Splitwise from that split; Sync Action = Delete removes the row if the " +
     "expense is genuinely void.");
@@ -2544,7 +2633,38 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
     }
     return pollConvertToNotionOnly_(cfg, dpage, "The Splitwise expense was deleted, but you paid this bill.");
   }
-  if (uids.indexOf(ownerId) < 0) return "skip";                  // owner not a participant — not our activity
+  if (uids.indexOf(ownerId) < 0) {
+    // §27 — the owner isn't on this expense. For one we've never recorded that is simply not our
+    // activity. But a row we DO have means the owner was taken off it on Splitwise — and skipping it
+    // left the old share in /report forever. Decided like a deletion (§24), by who paid:
+    //   imported from Splitwise -> someone else's expense they've taken you off: archive it
+    //   logged by the owner     -> the owner paid at the shop, which Splitwise can't undo: keep + flag
+    //   composite               -> flag only; one sub-expense can't speak for the whole row
+    // Only an expense EDITED after creation can have had the owner taken off it. Group scans and
+    // backfills return plenty of expenses the owner was never on; looking each one up in Notion would
+    // spend hundreds of queries of the run's time budget finding nothing.
+    if (!e.created_at || (e.updated_at || "") === e.created_at) return "skip";
+    var off = pollFindExpense_(cfg, swid);
+    if (!off) return "skip";
+    var offIds = pollRichText_(off.properties["Splitwise ID"]).split(",");
+    var offSrc = (off.properties["Source"] && off.properties["Source"].select && off.properties["Source"].select.name) || "";
+    if (offIds.length > 1) {
+      if (pollRichText_(off.properties["Sync Status"]).indexOf("[" + REVIEW_REMOVED + "]") < 0) {
+        var offProps = { "Sync Status": off.properties["Sync Status"] || { rich_text: [] } };
+        addReview_(offProps, REVIEW_REMOVED, "you are no longer on one of this row's Splitwise expenses (" + swid +
+          "), so it no longer matches what's recorded here. Check it in Splitwise; Re-push rebuilds it from this row.");
+        pollNotion_(cfg, "PATCH", "pages/" + off.id, { properties: { "Sync Status": offProps["Sync Status"] } });
+      }
+      return "update";
+    }
+    if (offSrc === "Splitwise") {
+      pollNotion_(cfg, "PATCH", "pages/" + off.id, { archived: true });
+      logToSheet("owner taken off an imported expense on Splitwise — archived: '" + desc + "'");
+      return "archive";
+    }
+    return pollConvertToNotionOnly_(cfg, off, "Splitwise no longer lists you on this expense, but you logged it, so you paid.",
+      REVIEW_REMOVED);
+  }
 
   var page = pollFindExpense_(cfg, swid);
   // §19 — cross-run duplicate-create guard: LockService only blocks *overlapping* pollSplitwise()
@@ -2593,14 +2713,19 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
   }
 
   var cost = parseFloat(e.cost || 0);
-  var payerId = null, ownerShare = 0;
+  var payerId = null, ownerShare = 0, ownerPaid = 0;
   for (var j = 0; j < users.length; j++) {
     var uu = users[j];
     var uid = uu.user_id || (uu.user && uu.user.id);
     if (payerId === null && parseFloat(uu.paid_share || 0) > 0) payerId = uid;
-    if (uid === ownerId) ownerShare = parseFloat(uu.owed_share || 0);
+    if (uid === ownerId) { ownerShare = parseFloat(uu.owed_share || 0); ownerPaid = parseFloat(uu.paid_share || 0); }
   }
-  var date = (e.date || "").substring(0, 10);
+  // The "bill is fixed, the payer absorbs what the others don't cover" rule below is only true when
+  // the OWNER is the one who paid. On someone else's expense where the owner owes nothing, it would
+  // invent a share: Mangalik cutting his ₹300 bill to ₹200 would leave the owner "absorbing" ₹100 of
+  // an expense they have no part in. There, Splitwise's own figures are the whole truth.
+  var ownerIsPayer = ownerPaid > 0.005;
+  var date = swLocalDate_(e.date);
 
   // §15: splits (owed_share > 0) → summary + Participants relation + Splits Data JSON on the row itself
   var summaryParts = [];
@@ -2628,7 +2753,7 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
   // Splitwise's cost IS the whole bill. If the others now exceed the recorded bill, the bill itself
   // must have grown, so believe Splitwise and let the owner's share fall to zero rather than negative.
   var billTotal = cost, ownerAbsorbed = 0;
-  if (ownerShare === 0 && page) {
+  if (ownerShare === 0 && ownerIsPayer && page) {
     var prevTotal = parseFloat((page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0) || 0;
     billTotal = Math.max(prevTotal, cost);
     ownerAbsorbed = Math.round((billTotal - cost) * 100) / 100;
@@ -2668,8 +2793,8 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
     // copies that, and there is no judgement to review — flagging it would fill the queue with
     // entries whose only resolution is to clear them, which is how a review queue stops being read.
     // When Splitwise reports the owner nothing, the share came from OUR arithmetic, so it is flagged.
-    if (ownerShare === 0) pollFlagShareAbsorbed_(props, prevAmount, null);
-    if (ownerShare === 0 && cost > prevBill + 0.5) {
+    if (ownerShare === 0 && ownerIsPayer) pollFlagShareAbsorbed_(props, prevAmount, null);
+    if (ownerShare === 0 && ownerIsPayer && cost > prevBill + 0.5) {
       addReview_(props, REVIEW_OVER_BILL, "the shares on Splitwise now total ₹" + cost.toFixed(2) +
         ", more than the ₹" + prevBill.toFixed(2) + " bill recorded here. The bill has been raised to ₹" +
         cost.toFixed(2) + " and your share set to ₹0.00 — check the receipt total, or the edited share.");
