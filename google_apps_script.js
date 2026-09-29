@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.13.1";
+var IRONBANK_VERSION = "1.14.0";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -217,6 +217,17 @@ function doPost(e) {
 
         // Ignore unauthorized chats for security
         if (!allowedChatId) {
+          // §31 — only a request that passed the webhook-secret check above may claim the owner chat.
+          // The check is skipped while TG_WEBHOOK_SECRET is unset, so without this, on a fresh deploy
+          // before setupWebhook has run, anyone holding the Web App URL could POST a Telegram-shaped
+          // update and register THEIR chat as the owner — and with it the Delete button on the real
+          // owner's expenses. Nothing legitimate is lost: setupWebhook saves the secret before it
+          // registers the webhook, so real Telegram updates always carry it. Older installs without a
+          // secret already have their chat registered and never reach this branch.
+          if (!expectedTg) {
+            logToSheet("⚠️ [doPost] No owner chat registered and no webhook secret yet — run setupWebhook first. Update dropped.");
+            return HtmlService.createHtmlOutput("OK");
+          }
           if (chatId) {
             logToSheet("ℹ️ [doPost] Auto-registering first chat ID: " + chatId);
             saveSetting("TELEGRAM_CHAT_ID", chatId);
@@ -1532,14 +1543,15 @@ function pollWatermarkIso_() {
 }
 
 // §13b/§17 — resolve a push plan by partitioning non-owner participants by their People.Default Group.
-// Returns { park: reason } (leave unpushed) OR { groups: [ {gid, participants:[{name,amount,swid}]} ] }.
-// gid 0 = the direct (non-group friend expense) bucket for people without an Allowed Default Group.
-// The owner's own share stays Notion-only and is never pushed. Pass prefetched People rows to
-// avoid re-scanning within one request.
-function resolvePushPlanForParticipants_(cfg, parsed, ownerName, peopleRows) {
-  var ownerLower = ownerName.toString().toLowerCase().replace(/^\s+|\s+$/g, "");
+// Groups page id -> { gid, allowed }, read once per execution. The push planner runs once per expense,
+// and the retry and Re-push loops call it for every parked row in turn — each call used to re-scan the
+// whole Groups database, so a backlog of 30 parked expenses cost 30 full scans in one sync run, against
+// Notion's rate limit and the run's time budget. Groups don't change mid-run (Apps Script globals reset
+// every execution), so one scan serves them all.
+var PUSH_GROUPS_CACHE_ = {};
 
-  // One Groups scan → page id -> { gid, allowed }
+function pushGroupsByPage_(cfg) {
+  if (PUSH_GROUPS_CACHE_[cfg.db.groups]) return PUSH_GROUPS_CACHE_[cfg.db.groups];
   var groupsByPage = {}, gc = null;
   do {
     var gb = { page_size: 100 }; if (gc) gb.start_cursor = gc;
@@ -1552,6 +1564,18 @@ function resolvePushPlanForParticipants_(cfg, parsed, ownerName, peopleRows) {
     }
     gc = gr.has_more ? gr.next_cursor : null;
   } while (gc);
+  PUSH_GROUPS_CACHE_[cfg.db.groups] = groupsByPage;
+  return groupsByPage;
+}
+
+// Returns { park: reason } (leave unpushed) OR { groups: [ {gid, participants:[{name,amount,swid}]} ] }.
+// gid 0 = the direct (non-group friend expense) bucket for people without an Allowed Default Group.
+// The owner's own share stays Notion-only and is never pushed. Pass prefetched People rows to
+// avoid re-scanning within one request.
+function resolvePushPlanForParticipants_(cfg, parsed, ownerName, peopleRows) {
+  var ownerLower = ownerName.toString().toLowerCase().replace(/^\s+|\s+$/g, "");
+
+  var groupsByPage = pushGroupsByPage_(cfg);
 
   // People routing: name+alias(lower) -> {swid, gid, name}. Readiness ⇔ has a Splitwise User ID;
   // an Allowed Default Group routes into that group, otherwise the direct (non-group) bucket.
@@ -2402,8 +2426,8 @@ function pollFindExpense_(cfg, swid) {
 // See the §20c note below the loop for why the owner's share is derived from that rather than read
 // back off Splitwise.
 function pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, personCache, swids, notionTotal) {
-  var totalCost = 0, ownerShare = 0, latestUpdatedAt = "";
-  var summaryParts = [], participantIds = [], splitsData = [], pseen = {};
+  var totalCost = 0, ownerShare = 0, ownerPaid = 0, latestUpdatedAt = "";
+  var participantIds = [], splitsData = [], pseen = {};
   var liveSwids = [], liveGids = [];
   for (var i = 0; i < swids.length; i++) {
     var sid = swids[i];
@@ -2418,7 +2442,7 @@ function pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, p
     for (var j = 0; j < eusers.length; j++) {
       var uu = eusers[j];
       var uid = uu.user_id || (uu.user && uu.user.id);
-      if (uid === ownerId) ownerShare += parseFloat(uu.owed_share || 0);
+      if (uid === ownerId) { ownerShare += parseFloat(uu.owed_share || 0); ownerPaid += parseFloat(uu.paid_share || 0); }
     }
     // Same owed>0 filter as the single-expense path — the owner is included too if this particular
     // sub-expense genuinely assigns them a share (rare for our own pushes, which always zero it, but
@@ -2431,38 +2455,24 @@ function pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, p
       var pname = idToName[suid] || ("User " + suid);
       var ppage = pollUpsertPerson_(cfg, { id: suid }, ownerId, ownerName, idToName, personCache);
       if (ppage && !pseen[ppage]) { participantIds.push({ id: ppage }); pseen[ppage] = true; }
-      summaryParts.push(pname + ": ₹" + owed.toFixed(2));
       splitsData.push({ person: pname, owed: Math.round(owed * 100) / 100 });
     }
   }
-  // §20c — the owner's own share is deliberately NEVER pushed to Splitwise: pushGroupExpense_ zeroes the
-  // payer's owed_share and bills `cost` to the participants only, because you don't owe yourself. That
-  // share therefore exists in Notion ALONE. Rebuilding purely from Splitwise consequently reports an
-  // owner share of 0 and a total short by exactly that amount — which writes Amount ₹0 against a real
-  // expense and drops it out of /report, the same silent loss as an empty split list. When Splitwise
-  // assigns the owner nothing, carry the row's existing Amount forward and add it back to the total.
-  // A hand-edited sub-expense that DOES give the owner a share wins instead: ownerShare is then > 0 and
-  // already included in exp.cost, so nothing is carried and Splitwise stays authoritative.
-  var billTotal = totalCost, carried = 0;
-  if (ownerShare === 0) {
-    var prevTotal = parseFloat(notionTotal || 0) || 0;
-    billTotal = Math.max(prevTotal, totalCost);
-    carried = Math.round((billTotal - totalCost) * 100) / 100;
-  }
-  if (carried > 0) {
+  // §20c — see ownerShareRule_. A composite row always exists already, so its Total is the recorded bill.
+  var rule = ownerShareRule_(totalCost, ownerShare, ownerPaid, parseFloat(notionTotal || 0) || 0);
+  if (rule.absorbed > 0) {
     var opage = pollUpsertPerson_(cfg, { id: ownerId }, ownerId, ownerName, idToName, personCache);
     if (opage && !pseen[opage]) { participantIds.push({ id: opage }); pseen[opage] = true; }
-    summaryParts.push(ownerName + ": ₹" + carried.toFixed(2));
-    splitsData.push({ person: ownerName, owed: carried });
+    splitsData.push({ person: ownerName, owed: rule.absorbed });
   }
 
   return {
     liveSwids: liveSwids,
     props: {
-      "Amount": { number: Math.round((ownerShare + carried) * 100) / 100 },
-      "Total Amount": { number: Math.round(billTotal * 100) / 100 },
+      "Amount": { number: Math.round((rule.owner + rule.absorbed) * 100) / 100 },
+      "Total Amount": { number: Math.round(rule.bill * 100) / 100 },
       "Participants": { relation: participantIds },
-      "Splits Summary": { rich_text: rtChunks_(summaryParts.join(", ")) },
+      "Splits Summary": { rich_text: rtChunks_(formatSplitsSummary_(splitsData, rule.bill)) },
       "Splits Data": { rich_text: rtChunks_(JSON.stringify(splitsData)) },
       "Splitwise ID": { rich_text: [{ text: { content: liveSwids.join(",") } }] },
       "Splitwise Group ID": { rich_text: [{ text: { content: liveGids.join(",") } }] },
@@ -2471,12 +2481,36 @@ function pollRebuildCompositeFields_(cfg, token, ownerId, ownerName, idToName, p
   };
 }
 
-// §20b — if a composite row's Total Amount just shrank (a sub-expense was deleted, or its cost was
-// edited down), flag it in Sync Status instead of letting it vanish silently. Deleting/reducing a
-// sub-expense doesn't move that money anywhere — someone may still genuinely be owed it, unless it
-// was already settled outside Splitwise. Only fires on a real drop; a same-cost redistribution among
-// fewer people (someone removed from an equal split, the rest absorb it) keeps the total unchanged
-// and is left alone.
+// §20c — THE rule for the owner's share of a synced expense, used by both the single-expense path and
+// the composite rebuild. It lived in two near-identical copies that had already drifted twice (1.5.1
+// fixed one copy only; the payer check was later added to one copy only).
+//   Splitwise states the owner's share          -> it is authoritative: that share, bill = cost
+//   the owner PAID but Splitwise gives them 0   -> the expense was pushed without the payer's own share
+//     (every pre-1.8.0 push, and every multi-group push), so the share lives in Notion alone. The bill
+//     recorded in Notion is the real one and does NOT move because a participant edited theirs: the
+//     owner absorbs whatever the others don't cover. If the others now exceed it, the bill itself grew.
+//   someone else paid, owner owes nothing       -> nothing to absorb: share 0, bill = cost
+// prevTotal is the row's current Total Amount, or null for a row being created (no recorded bill).
+function ownerShareRule_(cost, ownerOwed, ownerPaid, prevTotal) {
+  if (ownerOwed > 0.005 || !(ownerPaid > 0.005) || prevTotal == null) {
+    return { bill: cost, owner: ownerOwed, absorbed: 0, inferred: false };
+  }
+  var bill = Math.max(parseFloat(prevTotal) || 0, cost);
+  return { bill: bill, owner: 0, absorbed: Math.round((bill - cost) * 100) / 100, inferred: true };
+}
+
+// One Splits Summary format for every writer — "Name: ₹123.00 (45.0%)". The Telegram path wrote
+// percentages and the sync didn't, so a row's summary silently changed shape the first time Splitwise
+// touched it. `parts` is [{ person, owed }]; percentages are of `total`, omitted if it is 0.
+function formatSplitsSummary_(parts, total) {
+  var t = parseFloat(total) || 0, out = [];
+  for (var i = 0; i < parts.length; i++) {
+    var a = parseFloat(parts[i].owed) || 0;
+    out.push(parts[i].person + ": ₹" + a.toFixed(2) + (t > 0 ? " (" + (a / t * 100).toFixed(1) + "%)" : ""));
+  }
+  return out.join(", ");
+}
+
 // §23 — REVIEW FLAGS. Two things the sync must never do quietly: remove a row, or move money onto the
 // owner. Where it previously did either, it now records what happened here and leaves the row in place
 // for a human. The note is "⚠️ [Reason] detail", so a Notion view filters by reason with
@@ -2489,6 +2523,7 @@ var REVIEW_OVER_BILL = "Shares exceed bill";
 var REVIEW_RENAMED = "Renamed on Splitwise";
 var REVIEW_PICKED = "Name picked after push";
 var REVIEW_REMOVED = "Removed on Splitwise";
+var REVIEW_CURRENCY = "No longer INR";
 
 // Append rather than assign: one sync can legitimately raise two flags on the same row (a share
 // absorbed AND the bill replaced), and silently dropping one of them is the habit this whole section
@@ -2511,6 +2546,19 @@ function pollFlagShareAbsorbed_(props, oldAmount, droppedNames) {
     ", so yours grew ₹" + oldAmount.toFixed(2) + " → ₹" + newAmount.toFixed(2) +
     " on an unchanged ₹" + props["Total Amount"].number.toFixed(2) +
     " bill. Confirm it was settled outside Splitwise, or correct the shares there.");
+}
+
+// §32 — keep the Group relation honest when an expense moves between Splitwise groups. The relation is
+// filled by pollLinkExpenseGroups_, which only touches rows whose relation is EMPTY — so a moved expense
+// kept pointing at its old group forever, and any Notion view grouped by Group was wrong for it. When
+// the group ids change, clear the relation; the linker re-links it later in the same sync run (or leaves
+// it empty for a direct, non-group expense, which is correct). Group is an optional column: writing it
+// to a database without it would fail the whole page write, so it is only set when the schema has it.
+function pollResetGroupIfMoved_(cfg, page, props) {
+  var was = pollRichText_(page.properties["Splitwise Group ID"]);
+  var now = pollRichText_(props["Splitwise Group ID"]);
+  if (was === now || !now) return;
+  if (notionExpensesHasProp_(cfg, "Group")) props["Group"] = { relation: [] };
 }
 
 // §23 — a row whose Splitwise side is gone. NEVER archive: for an expense we pushed, the Splitwise
@@ -2551,7 +2599,24 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
   for (var i = 0; i < users.length; i++) uids.push(users[i].user_id || (users[i].user && users[i].user.id));
 
   if (e.payment) return "skip";                                  // settle-up transaction, not a real expense
-  if (e.currency_code && e.currency_code !== "INR") return "skip"; // R7: INR-only — never import foreign-currency amounts as ₹
+  if (e.currency_code && e.currency_code !== "INR") {
+    // R7: INR-only — never import foreign-currency amounts as ₹. §33: but an expense we already hold
+    // that was SWITCHED to another currency on Splitwise used to freeze silently here, its old ₹ figures
+    // still counted in /report. Flag it once instead (the amounts are not touched: they can't be
+    // converted honestly). Only an edited expense can have changed currency, so a never-edited one skips
+    // without a Notion lookup — group scans and backfills see plenty of foreign expenses.
+    if (!e.created_at || (e.updated_at || "") === e.created_at) return "skip";
+    var fx = pollFindExpense_(cfg, swid);
+    if (fx && pollRichText_(fx.properties["Sync Status"]).indexOf("[" + REVIEW_CURRENCY + "]") < 0) {
+      var fxProps = { "Sync Status": fx.properties["Sync Status"] || { rich_text: [] } };
+      addReview_(fxProps, REVIEW_CURRENCY, "this expense was changed to " + e.currency_code + " on Splitwise. " +
+        "IronBank only tracks INR, so this row has stopped syncing and still shows its old ₹ figures. " +
+        "Correct it here, or set Sync Action = Delete if it no longer belongs in your ledger.");
+      pollNotion_(cfg, "PATCH", "pages/" + fx.id, { properties: { "Sync Status": fxProps["Sync Status"] } });
+      return "update";
+    }
+    return "skip";
+  }
   if (e.deleted_at) {
     var dpage = pollFindExpense_(cfg, swid);
     if (!dpage) return "skip";
@@ -2578,6 +2643,7 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
       if (!rebuiltD.liveSwids.length) return pollConvertToNotionOnly_(cfg, dpage,
         "Every linked Splitwise expense is gone.");
       pollFlagShareAbsorbed_(rebuiltD.props, (dpage.properties["Amount"] && dpage.properties["Amount"].number) || 0, droppedNamesD);
+      pollResetGroupIfMoved_(cfg, dpage, rebuiltD.props);
       pollNotion_(cfg, "PATCH", "pages/" + dpage.id, { properties: rebuiltD.props });
       return "update";
     }
@@ -2675,6 +2741,7 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
         addReview_(rebuiltU.props, REVIEW_RENAMED, "a linked Splitwise expense is called \"" + desc +
           "\", which differs from this row's name. A row spanning several Splitwise expenses keeps its own description — rename it here if you want it changed.");
       }
+      pollResetGroupIfMoved_(cfg, page, rebuiltU.props);
       pollNotion_(cfg, "PATCH", "pages/" + page.id, { properties: rebuiltU.props });
       return "update";
     }
@@ -2696,7 +2763,6 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
   var date = swLocalDate_(e.date);
 
   // §15: splits (owed_share > 0) → summary + Participants relation + Splits Data JSON on the row itself
-  var summaryParts = [];
   var participantIds = [];
   var splitsData = [];
   var pseen = {};
@@ -2708,28 +2774,17 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
     var pname = idToName[suid] || ("User " + suid);
     var ppage = pollUpsertPerson_(cfg, memberById[suid] || { id: suid }, ownerId, ownerName, idToName, personCache);
     if (ppage && !pseen[ppage]) { participantIds.push({ id: ppage }); pseen[ppage] = true; }
-    summaryParts.push(pname + ": ₹" + owed.toFixed(2));
     splitsData.push({ person: pname, owed: Math.round(owed * 100) / 100 });
   }
 
-  // §20c — Total Amount is the REAL bill and does NOT move because a participant edited their share:
-  // the receipt was ₹299 whether Mangalik owes ₹217 or ₹165. For an expense we pushed, Splitwise holds
-  // only the OTHERS' shares (pushGroupExpense_ zeroes the payer's owed_share and bills `cost` to the
-  // participants), so the owner's share is simply what the bill leaves over — RECOMPUTE it rather than
-  // carrying the stale number. Someone lowering their share moves that money ONTO the payer; it does
-  // not leave the expense. UPDATE path only (`page`): a fresh import has no recorded bill, and there
-  // Splitwise's cost IS the whole bill. If the others now exceed the recorded bill, the bill itself
-  // must have grown, so believe Splitwise and let the owner's share fall to zero rather than negative.
-  var billTotal = cost, ownerAbsorbed = 0;
-  if (ownerShare === 0 && ownerIsPayer && page) {
-    var prevTotal = parseFloat((page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0) || 0;
-    billTotal = Math.max(prevTotal, cost);
-    ownerAbsorbed = Math.round((billTotal - cost) * 100) / 100;
-  }
+  // §20c — see ownerShareRule_. Only an existing row (`page`) has a recorded bill; a fresh import doesn't,
+  // and there Splitwise's cost IS the whole bill.
+  var prevBillForRule = page ? (parseFloat((page.properties["Total Amount"] && page.properties["Total Amount"].number) || 0) || 0) : null;
+  var rule = ownerShareRule_(cost, ownerShare, ownerIsPayer ? 1 : 0, prevBillForRule);
+  var billTotal = rule.bill, ownerAbsorbed = rule.absorbed;
   if (ownerAbsorbed > 0) {
     var ownPage = pollUpsertPerson_(cfg, { id: ownerId }, ownerId, ownerName, idToName, personCache);
     if (ownPage && !pseen[ownPage]) { participantIds.push({ id: ownPage }); pseen[ownPage] = true; }
-    summaryParts.push(ownerName + ": ₹" + ownerAbsorbed.toFixed(2));
     splitsData.push({ person: ownerName, owed: ownerAbsorbed });
   }
 
@@ -2738,7 +2793,7 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
     "Amount": { number: Math.round((ownerShare + ownerAbsorbed) * 100) / 100 },
     "Total Amount": { number: Math.round(billTotal * 100) / 100 },
     "Settlement Status": { select: { name: "Settled-via-Splitwise" } },
-    "Splits Summary": { rich_text: rtChunks_(summaryParts.join(", ")) },
+    "Splits Summary": { rich_text: rtChunks_(formatSplitsSummary_(splitsData, billTotal)) },
     "Splitwise ID": { rich_text: [{ text: { content: String(swid) } }] },
     "Splitwise Group ID": { rich_text: [{ text: { content: String(gid) } }] },
     "Splitwise Updated At": { rich_text: [{ text: { content: e.updated_at || "" } }] }
@@ -2782,6 +2837,7 @@ function pollUpsertExpense_(cfg, e, gid, ownerId, idToName, memberById, personCa
     // Update path deliberately writes only the fields Splitwise owns (amounts, splits, date, ids).
     // Expense Type / Payment Mode / Source are curated by the bot or the user — a later Splitwise
     // edit must not reset a categorized row to "Other"/"Unknown".
+    pollResetGroupIfMoved_(cfg, page, props);
     pollNotion_(cfg, "PATCH", "pages/" + page.id, { properties: props });
     return "update";
   }
@@ -3244,6 +3300,7 @@ function pollSplitwise(opts) {
       var ccy = pollGroupCurrency_(g);
       if (ccy && ccy !== "INR") {
         if (aentry.pageId) pollNotion_(cfg, "PATCH", "pages/" + aentry.pageId, { properties: { "Allowed": { checkbox: false } } });
+        PUSH_GROUPS_CACHE_ = {};   // a group's Allowed just changed — never route by the old map
         logToSheet("pollSplitwise: un-Allowed non-INR group " + g.name + " (" + ccy + ")");
         continue;
       }
@@ -3348,15 +3405,9 @@ function pollSplitwise(opts) {
 // Notion is the sole transaction record: build the splits summary, write the Expenses page,
 // return the Notion page id (or null when the write failed — callers must surface that).
 function recordExpense_(data, originalPrompt, source) {
-  var totalAmount = parseFloat(data.total_amount || 0);
-  var splitsList = data.splits || [];
-  var splitsSummaryParts = [];
-  for (var i = 0; i < splitsList.length; i++) {
-    var splitAmt = parseFloat(splitsList[i].amount);
-    var pct = totalAmount > 0 ? (splitAmt / totalAmount) * 100 : 0;
-    splitsSummaryParts.push(splitsList[i].name + ": ₹" + splitAmt.toFixed(2) + " (" + pct.toFixed(1) + "%)");
-  }
-  var splitsSummary = splitsSummaryParts.join(", ");
+  var splitsSummary = formatSplitsSummary_((data.splits || []).map(function (sp) {
+    return { person: sp.name, owed: sp.amount };
+  }), data.total_amount);
   try {
     return writeToNotion(data, source || "Telegram", getOwnerName(), splitsSummary, originalPrompt);
   } catch (notionErr) {
