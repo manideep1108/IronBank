@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.13.0";
+var IRONBANK_VERSION = "1.13.1";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -697,6 +697,8 @@ function finalizeExpense_(parsedJson, ctx, opts) {
     reply += "- " + sn + ": ₹" + parsedJson.splits[i].amount.toFixed(2) + mark + "\n";
   }
   reply += syncNote + sumWarn;
+  // §29 — which model in the fallback chain read this message, so a fallback is visible where it happens.
+  if (opts.model) reply += "\n\n_🤖 " + geminiLabel_(opts.model) + "_";
 
   var replyMarkup = {
     "inline_keyboard": [[
@@ -747,11 +749,12 @@ function processExpenseText(text, geminiKey, token, chatId, messageId, ownerName
       "generationConfig": expenseGenerationConfig_(ctx, "A SHORT label (2-4 words) for WHAT was bought, e.g. 'Alcohol', 'Auto to office', 'Dinner'. NEVER echo the input sentence back, and never include the amount, the split instructions, or participant names.")
     };
 
-    var parsedJson = JSON.parse(geminiGenerate_(geminiKey, payload, "[processExpenseText]").text);
+    var gen = geminiGenerate_(geminiKey, payload, "[processExpenseText]");
+    var parsedJson = JSON.parse(gen.text);
 
     finalizeExpense_(parsedJson, ctx, {
       kind: "text", token: token, chatId: chatId, messageId: messageId, ownerName: ownerName,
-      tag: "[processExpenseText]", source: "Telegram", auditText: text, resendNoun: "expense"
+      tag: "[processExpenseText]", source: "Telegram", auditText: text, resendNoun: "expense", model: gen.model
     });
   } catch (err) {
     logToSheet("🚨 [processExpenseText] Caught exception: " + err.toString());
@@ -865,7 +868,7 @@ function processReceiptPhoto(photoArray, caption, geminiKey, token, chatId, mess
     finalizeExpense_(parsedJson, ctx, {
       kind: "photo", token: token, chatId: chatId, messageId: messageId, ownerName: ownerName,
       tag: "📷 [processReceiptPhoto]", source: "Telegram Receipt Scanning",
-      auditText: "Receipt Photo" + (caption ? " (" + caption + ")" : ""), resendNoun: "receipt"
+      auditText: "Receipt Photo" + (caption ? " (" + caption + ")" : ""), resendNoun: "receipt", model: gen.model
     });
     logToSheet("📷 [processReceiptPhoto] Finished successfully.");
 
@@ -4549,6 +4552,7 @@ function geminiGenerate_(geminiKey, payload, tag) {
         try { answer = geminiText_(JSON.parse(txt)); } catch (pe) {}
         if (answer) {
           if (i > 0) logToSheet("🤖 " + tag + " answered by fallback " + c.label);
+          try { geminiRecordUse_(c.label); } catch (ue) {}   // bookkeeping must never fail a message
           return { text: answer, model: c.label };
         }
         lastErr = new Error("Gemini returned no answer (" + c.label + ") — possibly a safety filter or an oversized input.");
@@ -4564,11 +4568,34 @@ function geminiGenerate_(geminiKey, payload, tag) {
   throw lastErr || new Error("Gemini API error (no models configured)");
 }
 
-// One line for /status: the chain, and which models have used up today's quota.
+// "gemini-3.8-flash@low" -> "3.8 Flash (low thinking)" — for the Telegram reply footer.
+function geminiLabel_(label) {
+  var low = /@low$/.test(label);
+  var name = label.replace(/@low$/, "").replace(/^gemini-/, "").replace(/-/g, " ")
+                  .replace(/\b([a-z])/g, function (m) { return m.toUpperCase(); });
+  return name + (low ? " (low thinking)" : "");
+}
+
+// Successful calls per model for the current quota day (Pacific), so /status can show how close each
+// model is to its daily limit and whether the fallback has been doing any work.
+function geminiUsage_() {
+  var u = {};
+  try { u = JSON.parse(getSetting("GEMINI_USAGE") || "{}") || {}; } catch (e) { u = {}; }
+  return (u.day === geminiQuotaDay_() && u.counts) ? u.counts : {};
+}
+
+function geminiRecordUse_(label) {
+  var counts = geminiUsage_();
+  counts[label] = (counts[label] || 0) + 1;
+  saveSetting("GEMINI_USAGE", JSON.stringify({ day: geminiQuotaDay_(), counts: counts }));
+}
+
+// /status: the chain in order, with today's successful calls per model and any that are used up.
+// "Today" is Google's quota day, which resets at midnight Pacific (early afternoon in India).
 function geminiStatusLine_() {
-  var chain = geminiChain_(), spent = geminiSpent_();
-  return "Gemini: " + chain.map(function (c) {
-    return c.label.replace(/^gemini-/, "") + (spent[c.label] ? " (used up today)" : "");
+  var chain = geminiChain_(), spent = geminiSpent_(), used = geminiUsage_();
+  return "Gemini, calls this quota day: " + chain.map(function (c) {
+    return c.label.replace(/^gemini-/, "") + " " + (used[c.label] || 0) + (spent[c.label] ? " (used up)" : "");
   }).join(" → ");
 }
 
