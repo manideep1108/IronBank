@@ -10,7 +10,7 @@
 // (google_apps_script_loader.js). Deployments run whatever is on the branch
 // the loader points at — edit, commit, push to deploy.
 // ============================================================================
-var IRONBANK_VERSION = "1.14.0";
+var IRONBANK_VERSION = "1.14.1";
 var IRONBANK_SCHEMA_VERSION = "1";   // Notion schema generation this code expects (see onboarding.py)
 
 // ==========================================
@@ -4569,19 +4569,82 @@ function geminiText_(obj) {
   return out;
 }
 
+// §34 — a model that HANGS instead of failing. On 27 Oct 2026 Gemini stopped answering IronBank's
+// requests without returning an error: each call just sat until it timed out. UrlFetchApp has no timeout
+// setting, and the chain tried up to 4 models twice each, so every message ran into Apps Script's 6-minute
+// limit and was killed before it could reply — the bot went silent, with no error and no Retry button.
+// Three guards, so a hang costs at most one message and never silences the bot:
+//   • a call that fails slowly (or with a network error) marks the model "not responding" for an hour —
+//     it is not retried, and later messages try it after the healthy models;
+//   • before each call an in-flight marker is saved. If the execution is killed mid-call, the marker
+//     outlives it, and the next message marks that model not responding;
+//   • no new call is started once GEMINI_BUDGET_MS has passed, so the error reply still goes out.
+var GEMINI_BUDGET_MS = 150000;
+var GEMINI_SLOW_MS = 40000;
+var GEMINI_SICK_MS = 60 * 60 * 1000;
+var GEMINI_INFLIGHT_STALE_MS = 370000;   // longer than any execution can live
+
+// {label: untilMs} for models currently not responding.
+function geminiSick_() {
+  var o = {};
+  try { o = JSON.parse(getSetting("GEMINI_SICK") || "{}") || {}; } catch (e) { o = {}; }
+  var now = Date.now(), live = {};
+  for (var k in o) if (o[k] > now) live[k] = o[k];
+  return live;
+}
+
+function geminiMarkSick_(label) {
+  var live = geminiSick_();
+  live[label] = Date.now() + GEMINI_SICK_MS;
+  saveSetting("GEMINI_SICK", JSON.stringify(live));
+  logToSheet("🤖 " + label + " is not responding — tried after the other models for the next hour.");
+}
+
+// The in-flight marker is read and cleared straight from Script Properties, not the per-execution
+// getSetting cache: another execution may have written it since this one started.
+function geminiInflightStart_(label) {
+  var id = Utilities.getUuid().substring(0, 8);
+  try { PropertiesService.getScriptProperties().setProperty("GEMINI_INFLIGHT", JSON.stringify({ label: label, at: Date.now(), id: id })); } catch (e) {}
+  return id;
+}
+
+function geminiInflightEnd_(id) {
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var m = JSON.parse(props.getProperty("GEMINI_INFLIGHT") || "{}");
+    if (m.id === id) props.deleteProperty("GEMINI_INFLIGHT");
+  } catch (e) {}
+}
+
+// A marker older than any execution can live means the call that wrote it never returned.
+function geminiInflightReap_() {
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var m = JSON.parse(props.getProperty("GEMINI_INFLIGHT") || "{}");
+    if (m.label && Date.now() - m.at > GEMINI_INFLIGHT_STALE_MS) {
+      props.deleteProperty("GEMINI_INFLIGHT");
+      geminiMarkSick_(m.label);
+    }
+  } catch (e) {}
+}
+
 // Call the chain with one request. Returns { text, model }; throws the last error if every model fails.
 //   429, per-minute  -> next model at once (a burst never shows a Retry button)
 //   429, per-day     -> next model, and this one is skipped for the rest of its quota day
-//   5xx / network    -> one retry after 1.5s, then the next model
+//   5xx, quick       -> one retry after 1.5s, then the next model
+//   network / slow   -> next model at once, and this one is marked not responding (§34)
 //   400 / 403 / 404  -> next model (not available to this key, or this request unsupported by it)
 //   200, no answer   -> next model (blocked by a safety filter, or truncated)
-// Models already marked spent go LAST rather than being dropped: if the reset-time assumption is ever
-// wrong, a spent model is still tried before a message is given up on.
+// Order: healthy models, then not-responding ones, then spent ones. Nothing is dropped outright: if a
+// reset-time or health assumption is ever wrong, the model is still tried before a message is given up on.
 function geminiGenerate_(geminiKey, payload, tag) {
-  var chain = geminiChain_(), spent = geminiSpent_();
-  var order = chain.filter(function (c) { return !spent[c.label]; })
-                   .concat(chain.filter(function (c) { return spent[c.label]; }));
-  var lastErr = null;
+  geminiInflightReap_();
+  var chain = geminiChain_(), spent = geminiSpent_(), sick = geminiSick_();
+  var rank = function (c) { return spent[c.label] ? 2 : (sick[c.label] ? 1 : 0); };
+  var order = [0, 1, 2].reduce(function (acc, r) {
+    return acc.concat(chain.filter(function (c) { return rank(c) === r; }));
+  }, []);
+  var lastErr = null, t0 = Date.now(), tried = [];
   for (var i = 0; i < order.length; i++) {
     var c = order[i];
     var body = JSON.parse(JSON.stringify(payload));
@@ -4592,12 +4655,20 @@ function geminiGenerate_(geminiKey, payload, tag) {
     var url = "https://generativelanguage.googleapis.com/v1beta/models/" + c.model + ":generateContent?key=" + geminiKey;
     var opts = { method: "post", contentType: "application/json", payload: JSON.stringify(body), muteHttpExceptions: true };
     for (var attempt = 1; attempt <= 2; attempt++) {
-      var code = 0, txt = "";
+      if (Date.now() - t0 > GEMINI_BUDGET_MS) {
+        throw new Error("Gemini is not responding (tried " + tried.join(", ") + "). " +
+          (lastErr ? lastErr.message.substring(0, 160) : ""));
+      }
+      if (tried.indexOf(c.label) < 0) tried.push(c.label);
+      var code = 0, txt = "", callStart = Date.now();
+      var flight = geminiInflightStart_(c.label);
       try {
         var r = UrlFetchApp.fetch(url, opts);
         code = r.getResponseCode();
         txt = r.getContentText();
       } catch (fe) { txt = String(fe); }
+      geminiInflightEnd_(flight);
+      var slow = Date.now() - callStart > GEMINI_SLOW_MS;
       if (code === 200) {
         var answer = "";
         try { answer = geminiText_(JSON.parse(txt)); } catch (pe) {}
@@ -4611,7 +4682,8 @@ function geminiGenerate_(geminiKey, payload, tag) {
       }
       lastErr = new Error("Gemini API error (" + code + ") from " + c.label + ": " + String(txt).substring(0, 400));
       if (code === 429) { if (/PerDay/i.test(txt)) geminiMarkSpent_(c.label); break; }
-      if (code === 0 || code >= 500) { if (attempt < 2) { Utilities.sleep(1500); continue; } }
+      if (code === 0 || slow) { try { geminiMarkSick_(c.label); } catch (se) {} break; }
+      if (code >= 500 && attempt < 2) { Utilities.sleep(1500); continue; }
       break;
     }
     logToSheet("🤖 " + tag + " " + c.label + " failed — " + lastErr.message.substring(0, 160));
@@ -4644,9 +4716,10 @@ function geminiRecordUse_(label) {
 // /status: the chain in order, with today's successful calls per model and any that are used up.
 // "Today" is Google's quota day, which resets at midnight Pacific (early afternoon in India).
 function geminiStatusLine_() {
-  var chain = geminiChain_(), spent = geminiSpent_(), used = geminiUsage_();
+  var chain = geminiChain_(), spent = geminiSpent_(), used = geminiUsage_(), sick = geminiSick_();
   return "Gemini, calls this quota day: " + chain.map(function (c) {
-    return c.label.replace(/^gemini-/, "") + " " + (used[c.label] || 0) + (spent[c.label] ? " (used up)" : "");
+    return c.label.replace(/^gemini-/, "") + " " + (used[c.label] || 0) + (spent[c.label] ? " (used up)" : "") +
+      (sick[c.label] ? " (not responding)" : "");
   }).join(" → ");
 }
 
@@ -4654,7 +4727,9 @@ function handleGeminiFailure(token, chatId, messageId, error, retryData) {
   logToSheet("🚨 [handleGeminiFailure] Handling failure: " + error.toString());
   
   var errorMsg = "❌ *Error parsing transaction:*\n\n";
-  if (error.message && (error.message.indexOf("503") !== -1 || error.message.indexOf("UNAVAILABLE") !== -1)) {
+  if (error.message && error.message.indexOf("not responding") !== -1) {
+    errorMsg += "Gemini isn't responding right now (a Google-side problem). This expense was *not* logged — tap Retry in a few minutes.";
+  } else if (error.message && (error.message.indexOf("503") !== -1 || error.message.indexOf("UNAVAILABLE") !== -1)) {
     errorMsg += "The Gemini AI service is currently experiencing high demand. Spikes in demand are temporary.";
   } else if (error.message && (error.message.indexOf("429") !== -1 || error.message.indexOf("RESOURCE_EXHAUSTED") !== -1)) {
     errorMsg += "Rate limit exceeded. Please try again in a moment.";
